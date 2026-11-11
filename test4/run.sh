@@ -28,10 +28,11 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x .venv/bin/python ]; then
-  if ! python3 -m venv .venv; then
-    sudo apt-get update
-    sudo apt-get install -y python3-venv
+if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+  rm -rf .venv
+  if ! python3 -m venv .venv || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
     rm -rf .venv
     python3 -m venv .venv
   fi
