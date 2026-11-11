@@ -29,6 +29,7 @@ OKX_WS = "wss://ws.okx.com:8443/ws/v5/public"
 WIN = 300            # 场次长度(秒)
 LEAD = 20            # 提前多少秒预判
 CONF_TH = 0.04       # |p_up-0.5| 超过此值才算"有信心"的信号
+CL_LAG = 15          # 开盘/收盘价允许离边界最远的秒数，更旧就不当作有效结算价
 SAMPLE_OFFSETS = [60, 120, 180, 240]
 OUT = "data/rounds.csv"
 
@@ -93,6 +94,16 @@ def px_at(h, t):
     return None
 
 
+def px_near(h, t, max_lag):
+    """t 之前、且距离不超过 max_lag 秒的最后一口价。过期价格返回 None。"""
+    for ts, px in reversed(h):
+        if ts <= t:
+            if t - ts <= max_lag:
+                return ts, px
+            return None
+    return None
+
+
 def last(h):
     return h[-1][1] if h else None
 
@@ -112,9 +123,20 @@ async def pinger(ws, msg, sec):
         await ws.send_str(msg)
 
 
+def take_chainlink(it):
+    # 服务端按 btc/usd 过滤时只给一包快照，随后不再推送。这里订阅全品种，只留下 btc/usd。
+    sym = str(it.get("symbol") or "").lower()
+    if sym != "btc/usd" or "value" not in it:
+        return False
+    ts = it.get("timestamp", time.time() * 1000) / 1000
+    push(S.cl_h, ts, float(it["value"]))
+    S.last_msg["cl"] = time.time()
+    return True
+
+
 async def ws_chainlink(sess):
     sub = {"action": "subscribe", "subscriptions": [
-        {"topic": "crypto_prices_chainlink", "type": "*", "filters": json.dumps({"symbol": "btc/usd"})}]}
+        {"topic": "crypto_prices_chainlink", "type": "*"}]}
     while True:
         try:
             async with sess.ws_connect(RTDS) as ws:
@@ -136,9 +158,7 @@ async def ws_chainlink(sess):
                         else:
                             continue
                         for it in items:
-                            ts = it.get("timestamp", time.time() * 1000) / 1000
-                            push(S.cl_h, ts, float(it["value"]))
-                        S.last_msg["cl"] = time.time()
+                            take_chainlink(it)
                 finally:
                     pt.cancel()
         except Exception as e:
@@ -277,10 +297,13 @@ async def settle(sess, start, f, p_up, up_tok, dn_tok, book0):
         samples.append({"off": off, "up_bid": ub, "up_ask": ua, "dn_bid": db, "dn_ask": da,
                         "bn_ret_bps": None if ret is None else round(ret, 2)})
     await asyncio.sleep(max(0, start + WIN + 3 - time.time()))
-    c0, c1 = px_at(S.cl_h, start), px_at(S.cl_h, start + WIN)
-    if c0 is None or c1 is None:
-        log.warning("场次 %s 缺少 Chainlink 价格，本场跳过", fmt_round(start))
+    a = px_near(S.cl_h, start, CL_LAG)
+    b = px_near(S.cl_h, start + WIN, CL_LAG)
+    if not a or not b or b[0] <= start:
+        log.warning("场次 %s 的 Chainlink 没有同时覆盖开盘和收盘（最新价 %s），本场不记结果",
+                    fmt_round(start), fmt_px(last(S.cl_h)))
         return
+    c0, c1 = a[1], b[1]
     outcome = "Up" if c1 >= c0 else "Down"
     pred = "Up" if p_up >= 0.5 else "Down"
     conf = abs(p_up - 0.5) >= CONF_TH
