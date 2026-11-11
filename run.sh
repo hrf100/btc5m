@@ -20,6 +20,11 @@ elif [ -d "$INSTALL_DIR/.git" ]; then
   git -C "$INSTALL_DIR" pull --ff-only
 fi
 
+if [ "${BTC5M_INNER:-}" != 1 ]; then
+  export BTC5M_INNER=1
+  exec bash "$INSTALL_DIR/run.sh"
+fi
+
 cd "$INSTALL_DIR"
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -27,14 +32,27 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+has_pip() { .venv/bin/python -m pip --version >/dev/null 2>&1; }
+if ! has_pip; then
   rm -rf .venv
-  if ! python3 -m venv .venv || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
-    sudo DEBIAN_FRONTEND=noninteractive apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
-    rm -rf .venv
-    python3 -m venv .venv
+  python3 -m venv .venv || true
+fi
+if ! has_pip; then
+  echo "正在安装 python3-venv"
+  export DEBIAN_FRONTEND=noninteractive
+  if [ "$(id -u)" -eq 0 ]; then
+    apt-get update
+    apt-get install -y python3-venv python3-pip
+  else
+    sudo apt-get update
+    sudo apt-get install -y python3-venv python3-pip
   fi
+  rm -rf .venv
+  python3 -m venv .venv || true
+fi
+if ! has_pip; then
+  echo "虚拟环境仍没有 pip，改用 get-pip 安装"
+  curl -fsSL https://bootstrap.pypa.io/get-pip.py | .venv/bin/python
 fi
 
 .venv/bin/python -m pip install -r requirements.txt
