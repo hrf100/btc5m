@@ -35,6 +35,33 @@ OUT = "data/rounds.csv"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("btc5m")
 
+FEAT_NAME = {
+    "r1": "1分钟", "r3": "3分钟", "r5": "5分钟", "r15": "15分钟",
+    "flow": "主动买卖", "obi": "盘口", "lead": "币安领先", "bn_okx_bps": "币安减OKX",
+}
+SIDE = {"Up": "涨", "Down": "跌"}
+
+
+def fmt_round(ts):
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
+def fmt_px(v):
+    return "—" if v is None else f"{v:,.1f}"
+
+
+def fmt_quote(bid, ask):
+    one = lambda x: "—" if x is None else f"{x:.2f}"
+    return f"{one(bid)}/{one(ask)}"
+
+
+def fmt_feats(f):
+    parts = []
+    for k, name in FEAT_NAME.items():
+        v = f.get(k, 0.0)
+        parts.append(f"{name}{v:+.2f}" if k in ("flow", "obi") else f"{name}{v:+.1f}bp")
+    return " ".join(parts)
+
 
 class State:
     def __init__(self):
@@ -115,7 +142,7 @@ async def ws_chainlink(sess):
                 finally:
                     pt.cancel()
         except Exception as e:
-            log.warning("chainlink ws: %s", e)
+            log.warning("Chainlink 断开: %s", e)
         await asyncio.sleep(3)
 
 
@@ -139,7 +166,7 @@ async def ws_binance(sess):
                         S.obi["bn"] = (b - a) / (b + a) if b + a else 0.0
                     S.last_msg["bn"] = now
         except Exception as e:
-            log.warning("binance ws: %s", e)
+            log.warning("币安断开: %s", e)
         await asyncio.sleep(3)
 
 
@@ -171,7 +198,7 @@ async def ws_okx(sess):
                 finally:
                     pt.cancel()
         except Exception as e:
-            log.warning("okx ws: %s", e)
+            log.warning("OKX 断开: %s", e)
         await asyncio.sleep(3)
 
 
@@ -217,7 +244,7 @@ async def get_tokens(sess, start):
         d = {o.lower(): i for o, i in zip(outs, ids)}
         return d.get("up"), d.get("down")
     except Exception as e:
-        log.warning("gamma: %s", e)
+        log.warning("Polymarket 市场查询失败: %s", e)
         return None, None
 
 
@@ -252,7 +279,7 @@ async def settle(sess, start, f, p_up, up_tok, dn_tok, book0):
     await asyncio.sleep(max(0, start + WIN + 3 - time.time()))
     c0, c1 = px_at(S.cl_h, start), px_at(S.cl_h, start + WIN)
     if c0 is None or c1 is None:
-        log.warning("round %s: no chainlink data, skip", start)
+        log.warning("场次 %s 缺少 Chainlink 价格，本场跳过", fmt_round(start))
         return
     outcome = "Up" if c1 >= c0 else "Down"
     pred = "Up" if p_up >= 0.5 else "Down"
@@ -274,9 +301,9 @@ async def settle(sess, start, f, p_up, up_tok, dn_tok, book0):
     n = len(S.hits)
     acc = sum(h for h, _ in S.hits) / n
     cf = [h for h, c in S.hits if c]
-    log.info("round %s pred=%s(%.3f) outcome=%s %s | all %d acc=%.1f%% | confident %d acc=%s",
-             start, pred, p_up, outcome, "HIT" if hit else "MISS", n, acc * 100, len(cf),
-             f"{sum(cf)/len(cf)*100:.1f}%" if cf else "-")
+    log.info("场次 %s 预判%s(上涨%.1f%%) 结果%s %s | 全部%d场 命中率%.1f%% | 有信心%d场 命中率%s",
+             fmt_round(start), SIDE[pred], p_up * 100, SIDE[outcome], "命中" if hit else "未中",
+             n, acc * 100, len(cf), f"{sum(cf) / len(cf) * 100:.1f}%" if cf else "—")
 
 
 async def window_loop(sess):
@@ -289,8 +316,9 @@ async def window_loop(sess):
         p_up = predict(f)
         up_tok, dn_tok = await get_tokens(sess, start)
         (ub, ua), (db, da) = await asyncio.gather(best(sess, up_tok), best(sess, dn_tok))
-        log.info("next %s: p_up=%.3f %s | up %s/%s dn %s/%s", start, p_up,
-                 {k: round(v, 2) for k, v in f.items()}, ub, ua, db, da)
+        side = "涨" if p_up >= 0.5 else "跌"
+        log.info("下场 %s 预判%s 上涨概率%.1f%% | %s | 涨盘买/卖 %s 跌盘买/卖 %s",
+                 fmt_round(start), side, p_up * 100, fmt_feats(f), fmt_quote(ub, ua), fmt_quote(db, da))
         asyncio.create_task(settle(sess, start, f, p_up, up_tok, dn_tok, (ub, ua, db, da)))
         await asyncio.sleep(max(0, start + 1 - time.time()))
 
@@ -299,11 +327,14 @@ async def status():
     while True:
         await asyncio.sleep(30)
         now = time.time()
-        age = {k: (f"{now - v:.0f}s" if v else "NEVER") for k, v in S.last_msg.items()}
-        log.info("feed age: %s | cl=%s bn=%s okx=%s", age, last(S.cl_h), last(S.bn_h), last(S.okx_h))
+        names = {"cl": "Chainlink", "bn": "币安", "okx": "OKX"}
+        age = " ".join(f"{names[k]}{'从未收到' if not v else f'{now - v:.0f}秒前'}" for k, v in S.last_msg.items())
+        log.info("行情 %s | 价格 Chainlink %s 币安 %s OKX %s",
+                 age, fmt_px(last(S.cl_h)), fmt_px(last(S.bn_h)), fmt_px(last(S.okx_h)))
 
 
 async def main():
+    log.info("采集已启动，每5分钟场次开始前 %d 秒预判，结果写入 %s", LEAD, OUT)
     async with aiohttp.ClientSession() as sess:
         await asyncio.gather(ws_chainlink(sess), ws_binance(sess), ws_okx(sess),
                              window_loop(sess), status())
