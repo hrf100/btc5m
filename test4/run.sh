@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 服务器一行启动（与 btc5m 采集脚本分开，装到 ~/btc5m-4）:
 #   curl -fsSL https://raw.githubusercontent.com/hrf100/btc5m/main/test4/run.sh | bash
-# 再执行一次会先更新再重启。Chainlink 凭据放在 ~/.btc5m-4.env 。
+# 再执行一次会先更新再重启。私钥放在 ~/.btc5m-4.env 的 POLY_PRIVATE_KEY。
 set -euo pipefail
 
 REPO="https://github.com/hrf100/btc5m.git"

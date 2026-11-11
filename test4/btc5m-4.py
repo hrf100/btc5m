@@ -8,12 +8,12 @@ btc5m v2 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概�
     C >= P0 => Up (平局算Up)
 => 只要知道已发生的价格, 就能算出 P(C>=P0) 的公允概率; 越接近收盘越确定。
 
-环境变量:
-    POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE  (Polymarket CLOB API凭据, 用于Chainlink价格流)
-    DASH_TOKEN  (可选, 设置后访问看板需带 ?token=xxx)
+环境变量（写在服务器 ~/.btc5m-4.env ，不要放进仓库）:
+    POLY_PRIVATE_KEY  钱包私钥。启动时自动换取下面三项，不必手填
+    POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE  已经有凭据时直接用
+    DASH_TOKEN  可选，设置后访问看板需带 ?token=xxx
 服务器一行启动:
   curl -fsSL https://raw.githubusercontent.com/hrf100/btc5m/main/test4/run.sh | bash
-Chainlink 凭据写在服务器 ~/.btc5m-4.env ，不要放进仓库。
 """
 import asyncio, json, time, math, csv, os, logging, argparse
 from bisect import bisect_left, bisect_right
@@ -236,6 +236,77 @@ def _creds():
     return c if all(c) else None
 
 
+_CREDS = None
+AUTH_MSG = "This message attests that I control the given wallet"
+
+
+def _l1_headers(private_key, nonce=0):
+    """用私钥签 Polymarket 的 ClobAuth，换 API 凭据时用。"""
+    from eth_account import Account
+    acct = Account.from_key(private_key.strip())
+    ts = int(time.time())
+    signed = Account.sign_typed_data(
+        private_key.strip(),
+        domain_data={"name": "ClobAuthDomain", "version": "1", "chainId": 137},
+        message_types={"ClobAuth": [
+            {"name": "address", "type": "address"},
+            {"name": "timestamp", "type": "string"},
+            {"name": "nonce", "type": "uint256"},
+            {"name": "message", "type": "string"},
+        ]},
+        message_data={"address": acct.address, "timestamp": str(ts), "nonce": nonce, "message": AUTH_MSG},
+    )
+    sig = signed.signature.to_0x_hex()
+    return acct.address, {
+        "POLY_ADDRESS": acct.address,
+        "POLY_SIGNATURE": sig,
+        "POLY_TIMESTAMP": str(ts),
+        "POLY_NONCE": str(nonce),
+    }
+
+
+def _parse_creds(body):
+    if not isinstance(body, dict):
+        return None
+    got = (body.get("apiKey"), body.get("secret"), body.get("passphrase"))
+    return got if all(got) else None
+
+
+async def ensure_creds(sess):
+    """已有三项凭据就直接用；否则用私钥先取回已有凭据，没有再创建。"""
+    global _CREDS
+    if _CREDS:
+        return _CREDS
+    env = _creds()
+    if env:
+        _CREDS = env
+        log.info("使用已填写的 API 凭据")
+        return env
+    key = os.getenv("POLY_PRIVATE_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        address, headers = _l1_headers(key)
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with sess.get(f"{CLOB}/auth/derive-api-key", headers=headers, timeout=timeout) as r:
+            body = await r.json(content_type=None)
+            creds = _parse_creds(body) if r.status == 200 else None
+        if not creds:
+            async with sess.post(f"{CLOB}/auth/api-key", headers=headers, timeout=timeout) as r:
+                body = await r.json(content_type=None)
+                if r.status != 200:
+                    raise RuntimeError(f"创建失败 HTTP {r.status}")
+                creds = _parse_creds(body)
+        if not creds:
+            raise RuntimeError("响应里没有完整凭据")
+    except Exception as e:
+        log.warning("用私钥换取 API 凭据失败: %s", e)
+        return None
+    _CREDS = creds
+    log.info("已用私钥换取 API 凭据，地址 %s…%s", address[:6], address[-4:])
+    return creds
+
+
 def _crypto_points(pl):
     if not isinstance(pl, dict) or pl.get("symbol") != "btcusd":
         return []
@@ -249,10 +320,10 @@ def _crypto_points(pl):
 
 
 async def ws_poly(sess):
-    creds = _creds()
     gated = [{"channel": "price.crypto", "filter": {"symbol": "btcusd"}},
              {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60}}]
     while True:
+        creds = await ensure_creds(sess)
         try:
             async with sess.ws_connect(POLY_WS, heartbeat=None) as ws:
                 S.pm_ws = ws
@@ -261,7 +332,7 @@ async def ws_poly(sess):
                     await ws.send_json({"op": "auth", "rid": "a1", "auth": {
                         "apiKey": creds[0], "secret": creds[1], "passphrase": creds[2]}})
                 else:
-                    log.warning("未设置 POLY_API_* 凭据: 没有Chainlink价格, 退回币安代理")
+                    log.warning("没有 API 凭据或私钥: 没有 Chainlink 价格，退回币安代理")
                 subs = [{"channel": "price.polymarket", "filter": {"asset_id": t}} for t in S.tokens]
                 if subs:
                     await ws.send_json({"op": "subscribe", "rid": "s1", "subscriptions": subs})
