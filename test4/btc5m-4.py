@@ -447,15 +447,30 @@ async def get_tokens(sess, start):
         return None, None
 
 
+def official_tw(t, tol=5.0):
+    """时刻 t 的官方 Chainlink TWAP60；超过 tol 秒没有点则视为缺失。"""
+    i = bisect_right(S.tw.t, t) - 1
+    return S.tw.p[i] if i >= 0 and t - S.tw.t[i] <= tol else None
+
+
+def twap_outcome(start):
+    """Polymarket 真正的结算规则: 收盘TWAP60 >= 开盘TWAP60 => Up。这比等 Gamma closed 快得多。"""
+    p0, c = official_tw(start), official_tw(start + WIN)
+    if p0 is None or c is None:
+        return None, p0, c
+    return ("Up" if c >= p0 else "Down"), p0, c
+
+
 async def gamma_outcome(sess, start):
-    """官方结果: market closed 且 outcomePrices 为 1/0"""
+    """Polymarket 盘口结果: outcomePrices 已钉到约 0/1 即采信, 不必再等 closed。
+    closed 往往比价格钉住再晚好几分钟。"""
     try:
         async with sess.get(f"{GAMMA}/markets", params={"slug": f"btc-updown-5m-{start}"}, timeout=T5) as r:
             m = (await r.json())[0]
         outs, pr = m["outcomes"], m["outcomePrices"]
         outs = json.loads(outs) if isinstance(outs, str) else outs
         pr = [float(x) for x in (json.loads(pr) if isinstance(pr, str) else pr)]
-        if (m.get("closed") or m.get("umaResolutionStatus") == "resolved") and max(pr) >= 0.99 and min(pr) <= 0.01:
+        if max(pr) >= 0.99 and min(pr) <= 0.01:
             return outs[pr.index(max(pr))]
     except Exception:
         pass
@@ -631,58 +646,130 @@ def make_pred(s):
              s, w["pred"], p, r["mu"], r["sd"], rn, quote(w["up"]), quote(w["dn"]))
 
 
+def _patch_csv(path, start, updates):
+    """按 start 更新已有行; 没有该文件或找不到行则忽略。"""
+    if not os.path.exists(path):
+        return
+    with open(path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        return
+    fields = list(rows[0].keys())
+    hit = False
+    for row in rows:
+        if str(row.get("start")) == str(start):
+            for k, v in updates.items():
+                if k in fields:
+                    row[k] = v
+            hit = True
+            break
+    if not hit:
+        return
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore", restval="")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _record_round(w, s, outcome, src, calc, r, p0_tw, c_tw):
+    """写入 outcomes; 有预判时同步进看板历史。"""
+    r = r or {}
+    p0_calc = r.get("p0_self", r.get("p0", 0))
+    append_csv(f"{DATA}/outcomes.csv", {
+        "start": s, "outcome": outcome, "label": src, "calc_outcome": calc,
+        "p0_calc": round(p0_calc, 2) if p0_calc is not None else None,
+        "c_calc": round(r.get("c", 0), 2) if r.get("c") is not None else None,
+        "p0_tw": round(p0_tw, 2) if p0_tw else None, "c_tw": round(c_tw, 2) if c_tw else None})
+    if not w.get("pred"):
+        return None
+    row = {"start": s, "time_utc": time.strftime("%m-%d %H:%M", time.gmtime(s)),
+           "pred": w["pred"], "p_pred": round(w["p_pred"], 4), "conf": int(w["conf"]),
+           "outcome": outcome, "label": src, "hit": int(w["pred"] == outcome),
+           "calc_outcome": calc, "p0_calc": round(p0_calc, 2) if p0_calc is not None else None,
+           "c_calc": round(r.get("c", 0), 2) if r.get("c") is not None else None,
+           "p0_tw": round(p0_tw, 2) if p0_tw else None, "c_tw": round(c_tw, 2) if c_tw else None,
+           "ref": w["ref_name"], "sigma": round(S.sigma, 3), **w["f"],
+           "up_bid0": w["q0"][0], "up_ask0": w["q0"][1], "dn_bid0": w["q0"][2], "dn_ask0": w["q0"][3]}
+    append_csv(f"{DATA}/rounds_v2.csv", row)
+    S.rounds.append(row)
+    n = len(S.rounds)
+    acc = sum(x["hit"] for x in S.rounds) / n
+    cf = [x["hit"] for x in S.rounds if x["conf"]]
+    log.info("round %s pred=%s(%.3f) outcome=%s[%s] %s | n=%d acc=%.1f%% | conf n=%d acc=%s",
+             s, w["pred"], w["p_pred"], outcome, src, "HIT" if row["hit"] else "MISS", n,
+             acc * 100, len(cf), f"{sum(cf) / len(cf) * 100:.1f}%" if cf else "-")
+    return row
+
+
+def _upgrade_round(s, official, calc):
+    """官方结果到位后, 把内存和 CSV 里的自算结果升级为官方。"""
+    updates = {"outcome": official, "label": "polymarket", "calc_outcome": calc}
+    for row in reversed(S.rounds):
+        if row.get("start") == s:
+            row["outcome"] = official
+            row["label"] = "polymarket"
+            row["hit"] = int(row["pred"] == official)
+            updates["hit"] = row["hit"]
+            log.info("round %s 官方结果已更新: %s -> %s[%s] %s",
+                     s, calc, official, "polymarket", "HIT" if row["hit"] else "MISS")
+            break
+    _patch_csv(f"{DATA}/rounds_v2.csv", s, updates)
+    _patch_csv(f"{DATA}/outcomes.csv", s, {"outcome": official, "label": "polymarket", "calc_outcome": calc})
+
+
 async def settle(sess, s):
     E = s + WIN
-    await asyncio.sleep(max(0, E + 2 - time.time()))
+    # 多等几秒让收盘时刻的官方 TWAP60 点进来
+    await asyncio.sleep(max(0, E + 3 - time.time()))
     w = S.win.get(s)
     try:
         if w:
-            # 自算结果只用Chainlink价(不退回币安代理); 开盘/收盘15秒内都要有Chainlink价才有效
             cl_ok = cl_near(s) and cl_near(E)
             p0_tw = official_p0(s)
             r = fair(E + 1, s, S.cl, 1.0, p0_fix=p0_tw) if cl_ok and S.cl.last() is not None else None
-            # 对照用纯自算: 自算开盘均价 vs 自算收盘均价；模型里的 p0 可能已被官方 TWAP 覆盖
             calc = ("Up" if r["c"] >= r["p0_self"] else "Down") if r else None
-            outcome, src = None, "calc"
-            for it in range(40):
-                outcome = await gamma_outcome(sess, s)
-                if outcome:
-                    src = "polymarket"
+
+            # 1) 最快官方源: 已订阅的 Chainlink TWAP60 (就是 Polymarket 结算规则)
+            tw_out, p0_official, c_official = twap_outcome(s)
+            if tw_out is None:
+                for _ in range(8):  # 再等最多约8秒补齐收盘 TWAP
+                    await asyncio.sleep(1)
+                    tw_out, p0_official, c_official = twap_outcome(s)
+                    if tw_out:
+                        break
+            p0_tw = p0_official if p0_official is not None else p0_tw
+            c_tw = c_official
+
+            recorded = False
+            if tw_out:
+                _record_round(w, s, tw_out, "twap", calc, r, p0_tw, c_tw)
+                recorded = True
+            elif calc:
+                _record_round(w, s, calc, "calc", calc, r, p0_tw, c_tw)
+                recorded = True
+            else:
+                log.warning("round %s 暂无 TWAP/自算结果", s)
+
+            # 2) Polymarket Gamma: 价格钉到 0/1 即可, 不必等 closed (closed 往往更慢)
+            official = None
+            for it in range(36):
+                official = await gamma_outcome(sess, s)
+                if official:
                     break
-                if it in (10, 39):
-                    log.info("gamma结果未就绪 %s (第%d次): %s", s, it, await gamma_debug(sess, s))
-                await asyncio.sleep(8)
-            if outcome is None:
-                outcome = calc
-                if outcome is None:
-                    log.warning("round %s 跳过: 开盘或收盘15秒内没有有效Chainlink价, 且未取到官方结果", s)
-            if outcome:
-                r = r or {}
-                tw_ok = S.tw.t and S.tw.t[-1] >= E - 10
-                c_tw = S.tw.at(E) if tw_ok else None
-                p0_calc = r.get("p0_self", r.get("p0", 0))
-                # 每个场次都记录结果(含没做预判的), 供 analyze.py 回测
-                append_csv(f"{DATA}/outcomes.csv", {
-                    "start": s, "outcome": outcome, "label": src, "calc_outcome": calc,
-                    "p0_calc": round(p0_calc, 2), "c_calc": round(r.get("c", 0), 2),
-                    "p0_tw": round(p0_tw, 2) if p0_tw else None, "c_tw": round(c_tw, 2) if c_tw else None})
-                if w.get("pred"):
-                    row = {"start": s, "time_utc": time.strftime("%m-%d %H:%M", time.gmtime(s)),
-                           "pred": w["pred"], "p_pred": round(w["p_pred"], 4), "conf": int(w["conf"]),
-                           "outcome": outcome, "label": src, "hit": int(w["pred"] == outcome),
-                           "calc_outcome": calc, "p0_calc": round(p0_calc, 2),
-                           "c_calc": round(r.get("c", 0), 2),
-                           "p0_tw": round(p0_tw, 2) if p0_tw else None, "c_tw": round(c_tw, 2) if c_tw else None,
-                           "ref": w["ref_name"], "sigma": round(S.sigma, 3), **w["f"],
-                           "up_bid0": w["q0"][0], "up_ask0": w["q0"][1], "dn_bid0": w["q0"][2], "dn_ask0": w["q0"][3]}
-                    append_csv(f"{DATA}/rounds_v2.csv", row)
-                    S.rounds.append(row)
-                    n = len(S.rounds)
-                    acc = sum(x["hit"] for x in S.rounds) / n
-                    cf = [x["hit"] for x in S.rounds if x["conf"]]
-                    log.info("round %s pred=%s(%.3f) outcome=%s[%s] %s | n=%d acc=%.1f%% | conf n=%d acc=%s",
-                             s, w["pred"], w["p_pred"], outcome, src, "HIT" if row["hit"] else "MISS", n,
-                             acc * 100, len(cf), f"{sum(cf) / len(cf) * 100:.1f}%" if cf else "-")
+                if it in (3, 12, 35):
+                    log.info("gamma盘口未钉住 %s (第%d次): %s", s, it, await gamma_debug(sess, s))
+                await asyncio.sleep(5)
+
+            if official:
+                if recorded:
+                    if any(row.get("start") == s and row.get("outcome") != official for row in S.rounds):
+                        log.warning("round %s TWAP/自算=%s 与 Gamma=%s 不一致, 以 Gamma 为准",
+                                    s, tw_out or calc, official)
+                    _upgrade_round(s, official, calc)
+                else:
+                    _record_round(w, s, official, "polymarket", calc, r, p0_tw, c_tw)
+            elif not recorded:
+                log.warning("round %s 跳过: 无 TWAP/自算且 Gamma 未钉住", s)
     except Exception:
         log.exception("settle")
     if w and w.get("up"):
@@ -842,7 +929,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 const Q=location.search,$=id=>document.getElementById(id),f=(x,d=2)=>x==null?'-':Number(x).toFixed(d);
 const ud=x=>({Up:'涨',Down:'跌'}[x]||x||'-');
 const REF={'chainlink':'Chainlink','binance*':'币安(代理，未连上Chainlink)'};
-const LAB={'calc':'自算','polymarket':'官方'};
+const LAB={'calc':'自算','twap':'官方TWAP','polymarket':'盘口钉死'};
 const AUTH=a=>a=='ok'?'已认证':a=='no-creds'?'未配置凭据':a=='deriving'?'正在生成凭据':a=='derive-failed'?'凭据生成失败':a=='authenticating'?'认证中':(a||'').startsWith('FAILED')?'认证失败':a;
 const card=(k,v,c='',tip='')=>`<div class="card" title="${tip}"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
 const hm=s=>new Date(s*1000).toISOString().slice(11,16)+' UTC';
