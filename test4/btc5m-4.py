@@ -732,7 +732,7 @@ async def api_state(req):
              "cn": len(cf), "cacc": sum(x["hit"] for x in cf) / len(cf) if cf else None}
     feeds = {k: (now - v if v else None) for k, v in S.last_msg.items()}
     return web.json_response({**S.view, "chart": chart, "ticks": cur["ticks"] if cur else [],
-                              "rounds": rounds[-25:], "stats": stats, "feeds": feeds,
+                              "rounds": rounds, "stats": stats, "feeds": feeds,
                               "auth": S.auth, "cl_src": S.cl_src})
 
 
@@ -751,14 +751,20 @@ h2{margin:0 0 8px;font-size:16px;color:#e6edf3}h3{margin:16px 0 6px;color:#8aa;f
 .up{color:#3fb950}.dn{color:#f85149}.warn{color:#d29922}.mut{color:#7d8590}
 table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1px solid #232a34;text-align:right;white-space:nowrap}th{color:#7d8590}
 .wrap{overflow-x:auto}canvas{width:100%;height:230px;background:#161b22;border:1px solid #232a34;border-radius:6px}
-.tip{color:#7d8590;font-size:12px;margin:2px 0 6px}</style></head><body>
+.tip{color:#7d8590;font-size:12px;margin:2px 0 6px}
+.pager{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0}
+.pager button{background:#161b22;border:1px solid #30363d;color:#d6dbe3;border-radius:4px;padding:3px 10px;cursor:pointer}
+.pager button:hover{border-color:#58a6ff;color:#58a6ff}
+.pager button:disabled{opacity:.35;cursor:default;border-color:#232a34;color:#7d8590}
+.pager button.on{border-color:#58a6ff;color:#58a6ff}
+.pager .info{color:#7d8590;margin-left:4px}</style></head><body>
 <h2>BTC 5分钟涨跌盘 · 实时监控</h2>
 <div id="feeds"></div>
 <h3>当前场次</h3><div id="top" class="grid"></div>
 <h3>价格走势（近7分钟）</h3><div class="tip">竖线 = 场次边界；绿色虚线 = 本场开盘基准价（收盘均价高于它则“涨”）</div><canvas id="c1"></canvas>
 <h3>本场：模型上涨概率 与 盘口“涨”的买卖价</h3><div class="tip">横轴 = 开盘后秒数，240秒处为最后一分钟开始。绿线高于红线（涨卖一）越多，模型认为“涨”越被低估</div><canvas id="c2"></canvas>
 <h3>下一场预判</h3><div id="nxt"></div>
-<h3>历史场次</h3><div id="stats"></div><div class="wrap" id="tbl"></div>
+<h3>历史场次</h3><div id="stats"></div><div id="pager" class="pager"></div><div class="wrap" id="tbl"></div>
 <script>
 const Q=location.search,$=id=>document.getElementById(id),f=(x,d=2)=>x==null?'-':Number(x).toFixed(d);
 const ud=x=>({Up:'涨',Down:'跌'}[x]||x||'-');
@@ -768,6 +774,7 @@ const AUTH=a=>a=='ok'?'已认证':a=='no-creds'?'未配置凭据':a=='deriving'?
 const card=(k,v,c='',tip='')=>`<div class="card" title="${tip}"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
 const hm=s=>new Date(s*1000).toISOString().slice(11,16)+' UTC';
 const age=a=>a==null?'<span class=dn>无数据</span>':(a<5?`<span class=up>${a.toFixed(1)}秒</span>`:`<span class=warn>${a.toFixed(0)}秒</span>`);
+const PAGE_SIZE=20; let page=1, roundsCache=[];
 function plot(cv,lines,o={}){const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;
 const g=cv.getContext('2d');g.scale(dpr,dpr);let xs=[],ys=[];lines.forEach(l=>l.d.forEach(p=>{if(p[1]!=null){xs.push(p[0]);ys.push(p[1])}}));
 (o.h||[]).forEach(h=>ys.push(h.y));if(!xs.length)return;
@@ -778,6 +785,22 @@ g.font='10px monospace';g.lineWidth=1;for(let i=0;i<=4;i++){const y=y0+(y1-y0)*i
 (o.h||[]).forEach(h=>{g.strokeStyle=h.c;g.setLineDash([4,3]);g.beginPath();g.moveTo(44,Y(h.y));g.lineTo(W-8,Y(h.y));g.stroke();g.setLineDash([])});
 lines.forEach(l=>{g.strokeStyle=l.c;g.lineWidth=1.5;g.beginPath();let on=false;l.d.forEach(p=>{if(p[1]==null){on=false;return}const x=X(p[0]),y=Y(p[1]);if(on)g.lineTo(x,y);else{g.moveTo(x,y);on=true}});g.stroke()});
 let lx=48;lines.forEach(l=>{g.fillStyle=l.c;g.font='11px sans-serif';g.fillText(l.n,lx,9);lx+=l.n.length*12+16})}
+function pages(){return Math.max(1, Math.ceil(roundsCache.length / PAGE_SIZE))}
+function gotoPage(p){page=Math.min(Math.max(1,p), pages()); renderRounds()}
+function renderRounds(){
+const total=roundsCache.length, tp=pages();
+if(page>tp) page=tp;
+const start=(page-1)*PAGE_SIZE, rows=roundsCache.slice(start, start+PAGE_SIZE);
+let t='<table><tr><th>场次(UTC)</th><th>预判</th><th>预判概率</th><th>结果</th><th>命中</th><th>结果来源</th><th>开盘基准(自算)</th><th>收盘均价(自算)</th><th>开盘基准(官方)</th><th>收盘均价(官方)</th><th>预判时卖价 涨/跌</th></tr>';
+rows.forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${ud(r.pred)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔ 中':'✘ 错'}</td><td>${LAB[r.label]||r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td><td>${f(r.up_ask0,2)} / ${f(r.dn_ask0,2)}</td></tr>`});
+$('tbl').innerHTML=t+'</table>';
+let nums=''; const from=Math.max(1,page-2), to=Math.min(tp, page+2);
+for(let i=from;i<=to;i++) nums+=`<button class="${i===page?'on':''}" onclick="gotoPage(${i})">${i}</button>`;
+$('pager').innerHTML=`<button ${page<=1?'disabled':''} onclick="gotoPage(1)">首页</button>
+<button ${page<=1?'disabled':''} onclick="gotoPage(${page-1})">上一页</button>${nums}
+<button ${page>=tp?'disabled':''} onclick="gotoPage(${page+1})">下一页</button>
+<button ${page>=tp?'disabled':''} onclick="gotoPage(${tp})">末页</button>
+<span class="info">第 ${page}/${tp} 页，每页 ${PAGE_SIZE} 场，共 ${total} 场</span>`}
 function draw(d){const c=d.cur,F=d.feeds||{};
 $('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
 let h=card('参考价',f(d.spot),'','用于结算判断的价格（Chainlink，未连上时用币安代理）')
@@ -799,9 +822,8 @@ plot($('c1'),[L(1,'参考价','#e6edf3'),L(2,'币安','#58a6ff'),L(3,'欧易','#
 const T=d.ticks||[];plot($('c2'),[{n:'模型：涨的概率',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'“涨”卖一',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'“涨”买一',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
 const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'';
 const st=d.stats;$('stats').innerHTML=`共 ${st.n} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>`;
-let t='<table><tr><th>场次(UTC)</th><th>预判</th><th>预判概率</th><th>结果</th><th>命中</th><th>结果来源</th><th>开盘基准(自算)</th><th>收盘均价(自算)</th><th>开盘基准(官方)</th><th>收盘均价(官方)</th><th>预判时卖价 涨/跌</th></tr>';
-d.rounds.slice().reverse().forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${ud(r.pred)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔ 中':'✘ 错'}</td><td>${LAB[r.label]||r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td><td>${f(r.up_ask0,2)} / ${f(r.dn_ask0,2)}</td></tr>`});
-$('tbl').innerHTML=t+'</table>'}
+roundsCache=(d.rounds||[]).slice().reverse();
+renderRounds()}
 async function tick(){try{const r=await fetch('/api/state'+Q);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
 tick();setInterval(tick,1000);
 </script></body></html>'''
