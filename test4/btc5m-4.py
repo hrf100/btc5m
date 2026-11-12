@@ -183,6 +183,41 @@ def load_calib():
         pass
 
 
+def _num(v, cast=float):
+    if v in ("", None):
+        return None
+    try:
+        return cast(v)
+    except Exception:
+        return v
+
+
+def load_rounds():
+    """重启后从 CSV 恢复历史场次到看板。不覆盖文件，只读。"""
+    path = f"{DATA}/rounds_v2.csv"
+    if not os.path.exists(path):
+        baks = sorted(f for f in os.listdir(DATA) if f.startswith("rounds_v2.csv.") and f.endswith(".bak")) if os.path.isdir(DATA) else []
+        if baks:
+            log.warning("未找到 %s，但有归档 %s；如需恢复可手动改回原名", path, baks[-1])
+        return
+    try:
+        with open(path, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        for r in rows[-S.rounds.maxlen:]:
+            for k in ("p_pred", "p0_calc", "c_calc", "p0_tw", "c_tw",
+                      "up_bid0", "up_ask0", "dn_bid0", "dn_ask0", "sigma",
+                      "r1", "r3", "r5", "r15", "flow", "obi", "bn_cl_bps", "bn_okx_bps"):
+                if k in r:
+                    r[k] = _num(r[k], float)
+            for k in ("hit", "conf", "start"):
+                if k in r:
+                    r[k] = _num(r[k], int)
+            S.rounds.append(r)
+        log.info("已加载历史场次 %d 场", len(S.rounds))
+    except Exception:
+        log.exception("加载历史场次失败")
+
+
 def calibrate(p, tau):
     """Platt校准: 按 tau 分档修正模型概率 (参数由 analyze.py 生成)"""
     for lo, hi, a, b in CALIB:
@@ -851,6 +886,7 @@ tick();setInterval(tick,1000);
 
 async def main(host, port):
     load_calib()
+    load_rounds()
     async with aiohttp.ClientSession() as sess:
         app = web.Application()
         app.add_routes([web.get("/", index), web.get("/api/state", api_state)])
