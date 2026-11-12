@@ -955,8 +955,19 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 .pager button.on{border-color:#58a6ff;color:#58a6ff}
 .pager .info{color:#7d8590;margin-left:4px}
 .pager button.danger{border-color:#f85149;color:#f85149;margin-left:auto}
-.pager button.danger:hover{background:#3d1214}</style></head><body>
-<h2>BTC 5分钟涨跌盘 · 实时监控</h2>
+.pager button.danger:hover{background:#3d1214}
+.topline{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 8px}
+.topline h2{margin:0}
+.host-meters{display:flex;gap:8px;flex-wrap:wrap}
+.meter{display:flex;align-items:center;gap:8px;background:linear-gradient(180deg,#1a212b,#141a22);border:1px solid #2a3340;border-radius:12px;padding:5px 12px 5px 5px;min-width:118px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+.ring{--p:0;--c:#58a6ff;width:38px;height:38px;border-radius:50%;background:conic-gradient(var(--c) calc(var(--p) * 1%), #232a34 0);display:grid;place-items:center;position:relative;flex:0 0 auto}
+.ring:after{content:"";width:28px;height:28px;border-radius:50%;background:#12161c;border:1px solid #1f2630;position:absolute}
+.ring span{position:relative;z-index:1;font-size:9px;color:#e6edf3;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.meter .lab{font-size:10px;color:#7d8590;line-height:1.15}
+.meter .val{font-size:12px;color:#d6dbe3;font-variant-numeric:tabular-nums;line-height:1.2}
+.meter .sub{font-size:10px;color:#7d8590;line-height:1.15}
+#feeds{margin-bottom:2px}</style></head><body>
+<div class="topline"><h2>BTC 5分钟涨跌盘 · 实时监控</h2><div id="host" class="host-meters"></div></div>
 <div id="feeds"></div>
 <h3>当前场次</h3><div id="top" class="grid"></div>
 <h3>价格走势（近7分钟）</h3><div class="tip">竖线 = 场次边界；绿色虚线 = 本场开盘基准价（收盘均价高于它则“涨”）</div><canvas id="c1"></canvas>
@@ -1010,9 +1021,19 @@ page=1;roundsCache=[];renderRounds();
 alert('已清空 '+j.cleared+' 场'+(j.archived?'\n已归档: '+j.archived:''));
 tick();
 }catch(e){alert('清空失败: '+e)}}
+const meterColor=p=>p==null?'#58a6ff':(p<55?'#3fb950':(p<80?'#d29922':'#f85149'));
+const meter=(lab,pct,val,sub='')=>{const p=pct==null?0:Math.max(0,Math.min(100,pct));const shown=pct==null?'--':Math.round(p);
+return `<div class="meter" title="${lab}"><div class="ring" style="--p:${p};--c:${meterColor(pct)}"><span>${shown}</span></div><div><div class="lab">${lab}</div><div class="val">${val}</div>${sub?`<div class="sub">${sub}</div>`:''}</div></div>`};
+function drawHost(H){H=H||{};
+const cpu=H.cpu, memPct=(H.mem_used_mb!=null&&H.mem_total_mb)?(100*H.mem_used_mb/H.mem_total_mb):null;
+const procPct=(H.proc_mb!=null&&H.mem_total_mb)?(100*H.proc_mb/H.mem_total_mb):null;
+const cpuVal=cpu==null?'采样中…':`${Number(cpu).toFixed(1)}%`;
+const memVal=(H.mem_used_mb!=null&&H.mem_total_mb!=null)?`${H.mem_used_mb} / ${H.mem_total_mb} MB`:'-';
+const procVal=H.proc_mb==null?'-':`${H.proc_mb} MB`;
+$('host').innerHTML=meter('CPU',cpu,cpuVal,'整机占用')+meter('内存',memPct,memVal,'已用 / 总量')+meter('本进程',procPct,procVal,'RSS');}
 function draw(d){const c=d.cur,F=d.feeds||{};
-const H=d.host||{}, cpu=H.cpu==null?'-':(H.cpu+'%'), mem=(H.mem_used_mb!=null&&H.mem_total_mb!=null)?(`${H.mem_used_mb}/${H.mem_total_mb} MB`):'-', proc=H.proc_mb==null?'-':(H.proc_mb+' MB');
-$('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b> ｜ CPU <b>${cpu}</b> ｜ 内存 <b>${mem}</b> ｜ 本进程 <b>${proc}</b>`;
+drawHost(d.host);
+$('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
 let h=card('参考价',f(d.spot),'','用于结算判断的价格（Chainlink，未连上时用币安代理）')
 +card('币安 / 欧易',f(d.bn,1)+' / '+f(d.okx,1),'','两家交易所的最新成交价')
 +card('波动率 σ',f(d.sigma,2)+' 美元/√秒','','30秒尺度的价格波动，用于计算不确定度');
