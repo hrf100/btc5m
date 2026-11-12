@@ -527,23 +527,41 @@ async def ws_okx(sess):
 
 
 # ------------------------------------------------------------------ 场次生命周期
-_hdr_checked = set()
+# 默认不覆盖历史 CSV。只有 BTC5M_MIGRATE_CSV=1 时, 表头不兼容才归档旧文件另开新表。
+_csv_fields = {}
 
 
 def append_csv(path, row):
     os.makedirs(DATA, exist_ok=True)
-    if path not in _hdr_checked:   # 程序升级后列变了: 旧文件改名归档, 避免新数据列错位
-        _hdr_checked.add(path)
+    fields = _csv_fields.get(path)
+    if fields is None:
         if os.path.exists(path):
-            with open(path) as fh:
-                first = fh.readline().strip().split(",")
-            if first != list(row):
-                bak = f"{path}.{int(time.time())}.bak"
-                os.rename(path, bak)
-                log.info("%s 表头已变化, 旧文件归档为 %s", path, bak)
+            with open(path, newline="") as fh:
+                first = next(csv.reader(fh), [])
+            if first:
+                new_cols = [k for k in row if k not in first]
+                missing = [k for k in first if k not in row]
+                if new_cols or missing:
+                    if os.getenv("BTC5M_MIGRATE_CSV") == "1":
+                        bak = f"{path}.{int(time.time())}.bak"
+                        os.rename(path, bak)
+                        log.warning("%s 表头变化已归档为 %s (BTC5M_MIGRATE_CSV=1)", path, bak)
+                        fields = list(row)
+                    else:
+                        fields = first
+                        if new_cols:
+                            log.warning("%s 继续沿用旧表头, 新列未写入: %s; 需要迁移时设 BTC5M_MIGRATE_CSV=1",
+                                        path, ",".join(new_cols))
+                else:
+                    fields = first
+            else:
+                fields = list(row)
+        else:
+            fields = list(row)
+        _csv_fields[path] = fields
     new = not os.path.exists(path)
     with open(path, "a", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(row))
+        w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore", restval="")
         if new:
             w.writeheader()
         w.writerow(row)
