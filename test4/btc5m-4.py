@@ -791,6 +791,22 @@ async def api_state(req):
                               "auth": S.auth, "cl_src": S.cl_src})
 
 
+async def api_clear_rounds(req):
+    """清空看板历史场次；CSV 先归档为 .cleared.*.bak，不直接砸掉。"""
+    if not _auth(req):
+        return web.Response(status=401, text="bad token")
+    n = len(S.rounds)
+    S.rounds.clear()
+    path = f"{DATA}/rounds_v2.csv"
+    archived = None
+    if os.path.exists(path):
+        archived = f"{path}.cleared.{int(time.time())}.bak"
+        os.rename(path, archived)
+    _csv_fields.pop(path, None)
+    log.info("已清空历史场次 %d 场%s", n, f"，归档 {archived}" if archived else "")
+    return web.json_response({"ok": True, "cleared": n, "archived": archived})
+
+
 async def index(req):
     if not _auth(req):
         return web.Response(status=401, text="bad token")
@@ -812,7 +828,9 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 .pager button:hover{border-color:#58a6ff;color:#58a6ff}
 .pager button:disabled{opacity:.35;cursor:default;border-color:#232a34;color:#7d8590}
 .pager button.on{border-color:#58a6ff;color:#58a6ff}
-.pager .info{color:#7d8590;margin-left:4px}</style></head><body>
+.pager .info{color:#7d8590;margin-left:4px}
+.pager button.danger{border-color:#f85149;color:#f85149;margin-left:auto}
+.pager button.danger:hover{background:#3d1214}</style></head><body>
 <h2>BTC 5分钟涨跌盘 · 实时监控</h2>
 <div id="feeds"></div>
 <h3>当前场次</h3><div id="top" class="grid"></div>
@@ -855,7 +873,18 @@ $('pager').innerHTML=`<button ${page<=1?'disabled':''} onclick="gotoPage(1)">首
 <button ${page<=1?'disabled':''} onclick="gotoPage(${page-1})">上一页</button>${nums}
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${page+1})">下一页</button>
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${tp})">末页</button>
-<span class="info">第 ${page}/${tp} 页，每页 ${PAGE_SIZE} 场，共 ${total} 场</span>`}
+<span class="info">第 ${page}/${tp} 页，每页 ${PAGE_SIZE} 场，共 ${total} 场</span>
+<button class="danger" onclick="clearRounds()">清空重置</button>`}
+async function clearRounds(){
+if(!confirm('确定清空历史场次？命中率会归零。\n当前 rounds_v2.csv 会归档为 .cleared 备份，不会直接删除。\nticks/outcomes 分析文件保留。')) return;
+try{
+const r=await fetch('/api/rounds/clear'+Q,{method:'POST'});
+if(!r.ok){alert(r.status==401?'口令错误':'清空失败 HTTP '+r.status);return}
+const j=await r.json();
+page=1;roundsCache=[];renderRounds();
+alert('已清空 '+j.cleared+' 场'+(j.archived?'\n已归档: '+j.archived:''));
+tick();
+}catch(e){alert('清空失败: '+e)}}
 function draw(d){const c=d.cur,F=d.feeds||{};
 $('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
 let h=card('参考价',f(d.spot),'','用于结算判断的价格（Chainlink，未连上时用币安代理）')
@@ -894,7 +923,8 @@ async def main(host, port):
     load_rounds()
     async with aiohttp.ClientSession() as sess:
         app = web.Application()
-        app.add_routes([web.get("/", index), web.get("/api/state", api_state)])
+        app.add_routes([web.get("/", index), web.get("/api/state", api_state),
+                        web.post("/api/rounds/clear", api_clear_rounds)])
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, host, port).start()
