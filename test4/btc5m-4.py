@@ -817,7 +817,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 <div id="feeds"></div>
 <h3>当前场次</h3><div id="top" class="grid"></div>
 <h3>价格走势（近7分钟）</h3><div class="tip">竖线 = 场次边界；绿色虚线 = 本场开盘基准价（收盘均价高于它则“涨”）</div><canvas id="c1"></canvas>
-<h3>本场：模型上涨概率 与 盘口“涨”的买卖价</h3><div class="tip">横轴 = 开盘后秒数，240秒处为最后一分钟开始。绿线高于红线（涨卖一）越多，模型认为“涨”越被低估</div><canvas id="c2"></canvas>
+<h3>本场：模型上涨概率 与 「涨」份额买卖价</h3><div class="tip">这里比的是同一份「涨」合约：绿=模型P(涨)，红=涨份额卖一，黄=涨份额买一。不是涨对跌。绿线高于红线越多，模型认为「涨」越被低估</div><canvas id="c2"></canvas>
 <h3>下一场预判</h3><div id="nxt"></div>
 <h3>历史场次</h3><div id="stats"></div><div id="pager" class="pager"></div><div class="wrap" id="tbl"></div>
 <script>
@@ -874,7 +874,7 @@ $('top').innerHTML=h;
 const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
 const L=(i,n,col,v)=>({n,c:col,v,d:d.chart.map(r=>[r[0],r[i]])});
 plot($('c1'),[L(1,'参考价','#e6edf3',f(d.spot)),L(2,'币安','#58a6ff',f(d.bn,1)),L(3,'欧易','#a371f7',f(d.okx,1)),L(4,'官方60秒均价','#f0883e',f(d.chart&&d.chart.length?d.chart[d.chart.length-1][4]:null))],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
-const T=d.ticks||[];plot($('c2'),[{n:'模型：涨的概率',v:c?f(c.p,3):'-',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'“涨”卖一',v:c?f(c.up_ask,2):'-',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'“涨”买一',v:c?f(c.up_bid,2):'-',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
+const T=d.ticks||[];plot($('c2'),[{n:'模型P(涨)',v:c?f(c.p,3):'-',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'涨份额卖一',v:c?f(c.up_ask,2):'-',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'涨份额买一',v:c?f(c.up_bid,2):'-',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
 const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'';
 const st=d.stats;$('stats').innerHTML=`共 ${st.n} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>`;
 roundsCache=(d.rounds||[]).slice().reverse();
