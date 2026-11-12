@@ -856,6 +856,44 @@ async def status():
 
 
 # ------------------------------------------------------------------ Web 看板
+_cpu_sample = None
+
+
+def host_stats():
+    """读本机 CPU / 内存 (Linux /proc)。不额外装依赖。"""
+    global _cpu_sample
+    out = {"cpu": None, "mem_used_mb": None, "mem_total_mb": None, "proc_mb": None}
+    try:
+        with open("/proc/stat") as fh:
+            parts = fh.readline().split()
+        total = sum(int(x) for x in parts[1:8])
+        idle = int(parts[4]) + (int(parts[5]) if len(parts) > 5 else 0)
+        now = (total, idle)
+        if _cpu_sample and now[0] > _cpu_sample[0]:
+            out["cpu"] = round((1 - (now[1] - _cpu_sample[1]) / (now[0] - _cpu_sample[0])) * 100, 1)
+        _cpu_sample = now
+    except Exception:
+        pass
+    try:
+        info = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith(("MemTotal:", "MemAvailable:")):
+                    k, v, *_ = line.split()
+                    info[k[:-1]] = int(v)
+        if "MemTotal" in info and "MemAvailable" in info:
+            out["mem_total_mb"] = round(info["MemTotal"] / 1024)
+            out["mem_used_mb"] = round((info["MemTotal"] - info["MemAvailable"]) / 1024)
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    out["proc_mb"] = round(int(line.split()[1]) / 1024, 1)
+                    break
+    except Exception:
+        pass
+    return out
+
+
 def _auth(req):
     return not DASH_TOKEN or req.query.get("token") == DASH_TOKEN
 
@@ -875,7 +913,7 @@ async def api_state(req):
     feeds = {k: (now - v if v else None) for k, v in S.last_msg.items()}
     return web.json_response({**S.view, "chart": chart, "ticks": cur["ticks"] if cur else [],
                               "rounds": rounds, "stats": stats, "feeds": feeds,
-                              "auth": S.auth, "cl_src": S.cl_src})
+                              "auth": S.auth, "cl_src": S.cl_src, "host": host_stats()})
 
 
 async def api_clear_rounds(req):
@@ -973,7 +1011,8 @@ alert('已清空 '+j.cleared+' 场'+(j.archived?'\n已归档: '+j.archived:''));
 tick();
 }catch(e){alert('清空失败: '+e)}}
 function draw(d){const c=d.cur,F=d.feeds||{};
-$('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
+const H=d.host||{}, cpu=H.cpu==null?'-':(H.cpu+'%'), mem=(H.mem_used_mb!=null&&H.mem_total_mb!=null)?(`${H.mem_used_mb}/${H.mem_total_mb} MB`):'-', proc=H.proc_mb==null?'-':(H.proc_mb+' MB');
+$('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b> ｜ CPU <b>${cpu}</b> ｜ 内存 <b>${mem}</b> ｜ 本进程 <b>${proc}</b>`;
 let h=card('参考价',f(d.spot),'','用于结算判断的价格（Chainlink，未连上时用币安代理）')
 +card('币安 / 欧易',f(d.bn,1)+' / '+f(d.okx,1),'','两家交易所的最新成交价')
 +card('波动率 σ',f(d.sigma,2)+' 美元/√秒','','30秒尺度的价格波动，用于计算不确定度');
@@ -985,7 +1024,7 @@ if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+' 秒')
 +card('“涨” 买一 / 卖一',f(c.up_bid,2)+' / '+f(c.up_ask,2),'','Polymarket上“涨”份额的最高买价 / 最低卖价')
 +card('“跌” 买一 / 卖一',f(c.dn_bid,2)+' / '+f(c.dn_ask,2),'','Polymarket上“跌”份额的最高买价 / 最低卖价')
 +card('模型优势：涨 / 跌',f(c.edge_up,3)+' / '+f(c.edge_dn,3),(c.edge_up>.05||c.edge_dn>.05)?'warn':'','模型概率 减 盘口卖价。为正说明该方向按模型被低估；超过0.05会高亮（未扣手续费）')
-+card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无','','开盘前20秒做出的预判')}
++card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无',c.pred=='Up'?'up':(c.pred=='Down'?'dn':''),'开盘前20秒做出的预判')}
 $('top').innerHTML=h;
 const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
 const L=(i,n,col,v)=>({n,c:col,v,d:d.chart.map(r=>[r[0],r[i]])});
