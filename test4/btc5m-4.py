@@ -804,7 +804,7 @@ g.font='10px monospace';g.lineWidth=1;for(let i=0;i<=4;i++){const y=y0+(y1-y0)*i
 (o.v||[]).forEach(v=>{if(v<x0||v>x1)return;g.strokeStyle='#555';g.beginPath();g.moveTo(X(v),10);g.lineTo(X(v),H-16);g.stroke()});
 (o.h||[]).forEach(h=>{g.strokeStyle=h.c;g.setLineDash([4,3]);g.beginPath();g.moveTo(44,Y(h.y));g.lineTo(W-8,Y(h.y));g.stroke();g.setLineDash([])});
 lines.forEach(l=>{g.strokeStyle=l.c;g.lineWidth=1.5;g.beginPath();let on=false;l.d.forEach(p=>{if(p[1]==null){on=false;return}const x=X(p[0]),y=Y(p[1]);if(on)g.lineTo(x,y);else{g.moveTo(x,y);on=true}});g.stroke()});
-let lx=48;lines.forEach(l=>{g.fillStyle=l.c;g.font='11px sans-serif';g.fillText(l.n,lx,9);lx+=l.n.length*12+16})}
+let lx=48;g.font='11px sans-serif';lines.forEach(l=>{g.fillStyle=l.c;const label=l.v==null?l.n:`${l.n} ${l.v}`;g.fillText(label,lx,9);lx+=g.measureText(label).width+18})}
 function pages(){return Math.max(1, Math.ceil(roundsCache.length / PAGE_SIZE))}
 function gotoPage(p){page=Math.min(Math.max(1,p), pages()); renderRounds()}
 function renderRounds(){
@@ -837,9 +837,9 @@ if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+' 秒')
 +card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无','','开盘前20秒做出的预判')}
 $('top').innerHTML=h;
 const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
-const L=(i,n,col)=>({n,c:col,d:d.chart.map(r=>[r[0],r[i]])});
-plot($('c1'),[L(1,'参考价','#e6edf3'),L(2,'币安','#58a6ff'),L(3,'欧易','#a371f7'),L(4,'官方60秒均价','#f0883e')],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
-const T=d.ticks||[];plot($('c2'),[{n:'模型：涨的概率',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'“涨”卖一',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'“涨”买一',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
+const L=(i,n,col,v)=>({n,c:col,v,d:d.chart.map(r=>[r[0],r[i]])});
+plot($('c1'),[L(1,'参考价','#e6edf3',f(d.spot)),L(2,'币安','#58a6ff',f(d.bn,1)),L(3,'欧易','#a371f7',f(d.okx,1)),L(4,'官方60秒均价','#f0883e',f(d.chart&&d.chart.length?d.chart[d.chart.length-1][4]:null))],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
+const T=d.ticks||[];plot($('c2'),[{n:'模型：涨的概率',v:c?f(c.p,3):'-',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'“涨”卖一',v:c?f(c.up_ask,2):'-',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'“涨”买一',v:c?f(c.up_bid,2):'-',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
 const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'';
 const st=d.stats;$('stats').innerHTML=`共 ${st.n} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>`;
 roundsCache=(d.rounds||[]).slice().reverse();
