@@ -199,6 +199,59 @@ def main():
                       f"{avg:+8.3f} {m(pnl[:h]):+7.3f} {m(pnl[h:]):+7.3f} {be:10.1%}")
     print("读法: '每份盈亏'为正且'前半/后半'同号, 才可能是真优势; 笔数<100 的行不要相信。")
 
+    # ---- 3b. 模型 vs 盘口: 谁掌握更多信息 / 谁领先 ---------------------------
+    print("\n=== 3b. 模型 vs 盘口 ===")
+    import random
+    random.seed(1)
+    byw = collections.defaultdict(list)
+    for r in ticks:
+        st_, tau, p = int(r["start"]), fx(r["tau"]), fx(r["p_up"])
+        ua, ub, da, db = fx(r["up_ask"]), fx(r["up_bid"]), fx(r["dn_ask"]), fx(r["dn_bid"])
+        if st_ in up and None not in (tau, p, ua, ub, da, db):
+            byw[st_].append({"tau": tau, "p": p, "mid": (ua + ub + (1 - da) + (1 - db)) / 4, "y": up[st_]})
+    for rs in byw.values():
+        rs.sort(key=lambda r: r["tau"])
+
+    def slope(rs_):
+        xs = [r["p"] - r["mid"] for r in rs_]
+        ys = [r["y"] - r["mid"] for r in rs_]
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        sxx = sum((x - mx) ** 2 for x in xs)
+        return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else float("nan")
+
+    print("回归 (结果-盘口) ~ b*(模型-盘口): b>0且区间不含0 => 模型比盘口多知道东西; 区间含0 => 无法证明")
+    print(f"{'tau':>9} {'n':>5} {'模型Brier':>9} {'盘口Brier':>9} {'b':>6}   95%CI(按场次自助)")
+    for lo_t, hi_t in ((0, 60), (60, 120), (120, 180), (180, 240), (240, 300)):
+        S_, grp = [], collections.defaultdict(list)
+        for st_, rs in byw.items():
+            last_t = -99
+            for r in rs:
+                if lo_t <= r["tau"] < hi_t and r["tau"] - last_t >= 10:
+                    S_.append(r); grp[st_].append(r); last_t = r["tau"]
+        if len(grp) < 20:
+            continue
+        ws = list(grp)
+        bs = sorted(slope([r for w in [random.choice(ws) for _ in ws] for r in grp[w]]) for _ in range(300))
+        print(f"{lo_t:4d}-{hi_t:<4d} {len(S_):5d} {brier([r['p'] for r in S_], [r['y'] for r in S_]):9.4f} "
+              f"{brier([r['mid'] for r in S_], [r['y'] for r in S_]):9.4f} {slope(S_):+6.2f}   [{bs[7]:+.2f}, {bs[292]:+.2f}]")
+
+    print("领先/滞后: corr(盘口变动(t), 模型变动(t+k)), 峰值应在 k=0; 峰值在 k>0 说明盘口比我们的数据快")
+    line = []
+    for k in (-2, -1, 0, 1, 2, 3):
+        xs, ys = [], []
+        for rs in byw.values():
+            for i in range(1, len(rs)):
+                j = i + k
+                if 1 <= j < len(rs) and 30 <= rs[i]["tau"] < 290 and rs[i]["tau"] - rs[i - 1]["tau"] == 2 \
+                        and rs[j]["tau"] - rs[j - 1]["tau"] == 2:
+                    xs.append(rs[i]["mid"] - rs[i - 1]["mid"])
+                    ys.append(rs[j]["p"] - rs[j - 1]["p"])
+        if len(xs) > 100:
+            mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+            den = math.sqrt(sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys))
+            line.append(f"k={2 * k:+d}s:{sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den:+.2f}" if den else "")
+    print("  " + "  ".join(line))
+
     # ---- 4. Platt 校准 -------------------------------------------------------
     print("\n=== 4. 概率校准建议 (Platt: p' = sigmoid(a*logit(p)+b), 用后30%做样本外检验) ===")
     buckets = []

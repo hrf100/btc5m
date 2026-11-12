@@ -9,7 +9,7 @@ btc5m v2 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概�
 => 只要知道已发生的价格, 就能算出 P(C>=P0) 的公允概率; 越接近收盘越确定。
 
 环境变量（写在服务器 ~/.btc5m-4.env ，不要放进仓库）:
-    POLY_PRIVATE_KEY  钱包私钥。启动时自动换取下面三项，不必手填
+    POLY_PRIVATE_KEY  钱包私钥。启动时自动换取 API 凭据，不必手填三项
     POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE  已经有凭据时直接用
     DASH_TOKEN  可选，设置后访问看板需带 ?token=xxx
 服务器一行启动:
@@ -77,14 +77,39 @@ class St:
         self.pm, self.tokens, self.pm_ws = {}, set(), None
         self.win, self.rounds = {}, deque(maxlen=300)
         self.view, self.sigma = {}, DEFAULT_SIGMA
+        self.conn_t = 0.0          # 最近一次PolyBolt连接时间
+        self.cl_nofilter = False   # 看门狗触发后切换: 不带symbol过滤订阅, 本地过滤btcusd
 
 
 S = St()
 
 
+def cl_fresh(now=None):
+    """Chainlink现货是否新鲜: 消息刚到达(<5s) 且 价格自带时间戳也够新(<10s)。
+    只看到达时间会漏掉"消息还在来但价格是旧的/重复的"这种情况。"""
+    now = now or time.time()
+    return bool(S.cl_src == "chainlink" and S.cl.t and now - S.last_msg["cl"] < 5 and now - S.cl.t[-1] < 10)
+
+
+def cl_near(t, tol=15.0):
+    """t±tol 秒内是否有过Chainlink价格点 (用于判断场次开盘/收盘时数据是否有效)"""
+    i = bisect_left(S.cl.t, t - tol)
+    return i < len(S.cl.t) and S.cl.t[i] <= t + tol
+
+
+def cl_stalled(now=None, limit=20.0):
+    """已认证连接着, 但Chainlink价格流超过limit秒没有新点 -> 视为订阅静默/卡死"""
+    now = now or time.time()
+    if S.auth != "ok" or S.pm_ws is None or S.pm_ws.closed:
+        return False
+    if now - S.conn_t < limit:
+        return False
+    return (not S.cl.t) or now - S.cl.t[-1] > limit or now - S.last_msg["cl"] > limit
+
+
 def get_ref():
     """结算用的参考价: Chainlink现货优先, 否则退回币安(代理)"""
-    if S.cl_src == "chainlink" and S.cl.t and time.time() - S.last_msg["cl"] < 5:
+    if cl_fresh():
         return S.cl, "chainlink"
     return S.bn, "binance*"
 
@@ -101,7 +126,7 @@ def _G(a1, b1, a2, b2):
     return _F(b1, b2) - _F(a1, b2) - _F(b1, a2) + _F(a1, a2)
 
 
-def fair(t, s0, ref, sigma, p0_fix=None):
+def fair(t, s0, ref, sigma, p0_fix=None, shift=0.0):
     """
     在时刻t, 估计 P(C >= P0)。
     P0 = 均值[s0-60, s0], C = 均值[s0+240, s0+300]。已发生部分用历史价, 未发生部分用当前价+布朗运动。
@@ -111,6 +136,7 @@ def fair(t, s0, ref, sigma, p0_fix=None):
     st = ref.at(t)
     if st is None:
         return None
+    st += shift          # nowcast: 用币安领先量修正Chainlink的约2秒滞后
 
     def avg_part(a, b):
         kb = min(b, t)
@@ -170,6 +196,27 @@ def official_p0(s0):
     """开盘时刻的官方 Chainlink TWAP60 (流里离s0最近且不晚于s0的点, 超过3秒视为没有)"""
     i = bisect_right(S.tw.t, s0) - 1
     return S.tw.p[i] if i >= 0 and s0 - S.tw.t[i] <= 3 else None
+
+
+def est_sigma_h(h, now, lag=30, span=1200):
+    """lag秒尺度的波动 ($/sqrt(s))。Chainlink现货方差比随周期上升(60秒约为2秒的1.67倍),
+    逐tick估计会低估30-60秒波动约29%, 导致高概率区间过度自信。"""
+    n, acc, t = 0, 0.0, now - span
+    while t + lag <= now:
+        a, b = h.at(t), h.at(t + lag)
+        if a is not None and b is not None:
+            acc += (b - a) ** 2
+            n += 1
+        t += 5.0
+    return math.sqrt(acc / (n * lag)) if n >= 20 else None
+
+
+def nowcast_shift(now, g=2.0):
+    """币安领先Chainlink约2秒: 用 bn(now)-bn(now-g) 估计Chainlink即将出现的变动"""
+    if not S.bn.t or now - S.bn.t[-1] > 3:
+        return 0.0
+    b0 = S.bn.at(now - g)
+    return S.bn.p[-1] - b0 if b0 is not None else 0.0
 
 
 def est_sigma(h, now, span=300):
@@ -236,75 +283,48 @@ def _creds():
     return c if all(c) else None
 
 
-_CREDS = None
-AUTH_MSG = "This message attests that I control the given wallet"
+def _g(o, *names):
+    for n in names:
+        v = getattr(o, n, None)
+        if v is None and isinstance(o, dict):
+            v = o.get(n)
+        if v:
+            return v
+    return None
 
 
-def _l1_headers(private_key, nonce=0):
-    """用私钥签 Polymarket 的 ClobAuth，换 API 凭据时用。"""
-    from eth_account import Account
-    acct = Account.from_key(private_key.strip())
-    ts = int(time.time())
-    signed = Account.sign_typed_data(
-        private_key.strip(),
-        domain_data={"name": "ClobAuthDomain", "version": "1", "chainId": 137},
-        message_types={"ClobAuth": [
-            {"name": "address", "type": "address"},
-            {"name": "timestamp", "type": "string"},
-            {"name": "nonce", "type": "uint256"},
-            {"name": "message", "type": "string"},
-        ]},
-        message_data={"address": acct.address, "timestamp": str(ts), "nonce": nonce, "message": AUTH_MSG},
-    )
-    sig = signed.signature.to_0x_hex()
-    return acct.address, {
-        "POLY_ADDRESS": acct.address,
-        "POLY_SIGNATURE": sig,
-        "POLY_TIMESTAMP": str(ts),
-        "POLY_NONCE": str(nonce),
-    }
+_last_derive = [0.0]
 
 
-def _parse_creds(body):
-    if not isinstance(body, dict):
+async def maybe_derive():
+    """没有 POLY_API_* 但有 POLY_PRIVATE_KEY 时, 自动生成API凭据(只放内存, 不落盘)"""
+    c = _creds()
+    pk = os.getenv("POLY_PRIVATE_KEY")
+    if c or not pk:
+        return c
+    if time.time() - _last_derive[0] < 60:
         return None
-    got = (body.get("apiKey"), body.get("secret"), body.get("passphrase"))
-    return got if all(got) else None
+    _last_derive[0] = time.time()
+    S.auth = "deriving"
 
+    def work():
+        from py_clob_client_v2 import ClobClient
+        cr = ClobClient(host=CLOB, chain_id=137, key=pk).create_or_derive_api_key()
+        return _g(cr, "api_key", "apiKey", "key"), _g(cr, "api_secret", "secret"), _g(cr, "api_passphrase", "passphrase")
 
-async def ensure_creds(sess):
-    """已有三项凭据就直接用；否则用私钥先取回已有凭据，没有再创建。"""
-    global _CREDS
-    if _CREDS:
-        return _CREDS
-    env = _creds()
-    if env:
-        _CREDS = env
-        log.info("使用已填写的 API 凭据")
-        return env
-    key = os.getenv("POLY_PRIVATE_KEY", "").strip()
-    if not key:
-        return None
     try:
-        address, headers = _l1_headers(key)
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with sess.get(f"{CLOB}/auth/derive-api-key", headers=headers, timeout=timeout) as r:
-            body = await r.json(content_type=None)
-            creds = _parse_creds(body) if r.status == 200 else None
-        if not creds:
-            async with sess.post(f"{CLOB}/auth/api-key", headers=headers, timeout=timeout) as r:
-                body = await r.json(content_type=None)
-                if r.status != 200:
-                    raise RuntimeError(f"创建失败 HTTP {r.status}")
-                creds = _parse_creds(body)
-        if not creds:
-            raise RuntimeError("响应里没有完整凭据")
+        k, sec, pp = await asyncio.to_thread(work)
+        if k and sec and pp:
+            os.environ["POLY_API_KEY"], os.environ["POLY_API_SECRET"], os.environ["POLY_API_PASSPHRASE"] = k, sec, pp
+            log.info("已用私钥自动生成 Polymarket API 凭据 (仅内存, 未落盘)")
+            return (k, sec, pp)
+        log.warning("自动生成API凭据: SDK返回内容不完整")
+    except ImportError:
+        log.warning("缺少 py-clob-client-v2: 请运行 /opt/btc5m/venv/bin/pip install py-clob-client-v2")
     except Exception as e:
-        log.warning("用私钥换取 API 凭据失败: %s", e)
-        return None
-    _CREDS = creds
-    log.info("已用私钥换取 API 凭据，地址 %s…%s", address[:6], address[-4:])
-    return creds
+        log.warning("自动生成API凭据失败: %s: %s", type(e).__name__, str(e).replace(pk, "***")[:200])
+    S.auth = "derive-failed"
+    return None
 
 
 def _crypto_points(pl):
@@ -320,19 +340,23 @@ def _crypto_points(pl):
 
 
 async def ws_poly(sess):
-    gated = [{"channel": "price.crypto", "filter": {"symbol": "btcusd"}},
-             {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60}}]
     while True:
-        creds = await ensure_creds(sess)
+        creds = await maybe_derive()
         try:
             async with sess.ws_connect(POLY_WS, heartbeat=None) as ws:
                 S.pm_ws = ws
+                S.conn_t = time.time()
+                gated = [{"channel": "price.crypto"} if S.cl_nofilter else
+                         {"channel": "price.crypto", "filter": {"symbol": "btcusd"}},
+                         {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60}}]
+                if S.cl_nofilter:
+                    log.info("price.crypto 使用不带过滤的订阅, 本地只保留 btcusd")
                 if creds:
                     S.auth = "authenticating"
                     await ws.send_json({"op": "auth", "rid": "a1", "auth": {
                         "apiKey": creds[0], "secret": creds[1], "passphrase": creds[2]}})
                 else:
-                    log.warning("没有 API 凭据或私钥: 没有 Chainlink 价格，退回币安代理")
+                    log.warning("没有 POLY_PRIVATE_KEY / POLY_API_* : 没有Chainlink价格, 退回币安代理")
                 subs = [{"channel": "price.polymarket", "filter": {"asset_id": t}} for t in S.tokens]
                 if subs:
                     await ws.send_json({"op": "subscribe", "rid": "s1", "subscriptions": subs})
@@ -396,11 +420,25 @@ async def gamma_outcome(sess, start):
         outs, pr = m["outcomes"], m["outcomePrices"]
         outs = json.loads(outs) if isinstance(outs, str) else outs
         pr = [float(x) for x in (json.loads(pr) if isinstance(pr, str) else pr)]
-        if m.get("closed") and max(pr) >= 0.99 and min(pr) <= 0.01:
+        if (m.get("closed") or m.get("umaResolutionStatus") == "resolved") and max(pr) >= 0.99 and min(pr) <= 0.01:
             return outs[pr.index(max(pr))]
     except Exception:
         pass
     return None
+
+
+async def gamma_debug(sess, start):
+    """官方结果取不到时, 打印Gamma返回的关键字段以便排查"""
+    try:
+        async with sess.get(f"{GAMMA}/markets", params={"slug": f"btc-updown-5m-{start}"}, timeout=T5) as r:
+            j = await r.json()
+        if not j:
+            return "empty list (slug不存在?)"
+        m = j[0]
+        return {k: m.get(k) for k in ("closed", "active", "archived", "umaResolutionStatus",
+                                       "outcomePrices", "endDate", "resolvedBy") if k in m}
+    except Exception as e:
+        return f"error {type(e).__name__}: {e}"
 
 
 async def rest_best(sess, token):
@@ -489,8 +527,20 @@ async def ws_okx(sess):
 
 
 # ------------------------------------------------------------------ 场次生命周期
+_hdr_checked = set()
+
+
 def append_csv(path, row):
     os.makedirs(DATA, exist_ok=True)
+    if path not in _hdr_checked:   # 程序升级后列变了: 旧文件改名归档, 避免新数据列错位
+        _hdr_checked.add(path)
+        if os.path.exists(path):
+            with open(path) as fh:
+                first = fh.readline().strip().split(",")
+            if first != list(row):
+                bak = f"{path}.{int(time.time())}.bak"
+                os.rename(path, bak)
+                log.info("%s 表头已变化, 旧文件归档为 %s", path, bak)
     new = not os.path.exists(path)
     with open(path, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(row))
@@ -517,7 +567,7 @@ def make_pred(s):
     if len(S.bn.t) < 120 or ref.last() is None:
         log.info("next %s: 历史数据不足, 跳过预判", s)
         return
-    r = fair(time.time(), s, ref, S.sigma)
+    r = fair(time.time(), s, ref, S.sigma, shift=nowcast_shift(time.time()) if rn == "chainlink" else 0.0)
     if not r:
         return
     p = calibrate(r["p"], time.time() - s)
@@ -534,18 +584,23 @@ async def settle(sess, s):
     w = S.win.get(s)
     try:
         if w:
-            ref, rn = get_ref()
-            r = fair(E + 1, s, ref, 1.0, p0_fix=official_p0(s)) if ref.last() is not None else None
+            # 自算结果只用Chainlink价(不退回币安代理); 开盘/收盘15秒内都要有Chainlink价才有效
+            cl_ok = cl_near(s) and cl_near(E)
+            r = fair(E + 1, s, S.cl, 1.0, p0_fix=official_p0(s)) if cl_ok and S.cl.last() is not None else None
             calc = ("Up" if r["c"] >= r["p0"] else "Down") if r else None
             outcome, src = None, "calc"
-            for _ in range(40):
+            for it in range(40):
                 outcome = await gamma_outcome(sess, s)
                 if outcome:
                     src = "polymarket"
                     break
+                if it in (10, 39):
+                    log.info("gamma结果未就绪 %s (第%d次): %s", s, it, await gamma_debug(sess, s))
                 await asyncio.sleep(8)
             if outcome is None:
                 outcome = calc
+                if outcome is None:
+                    log.warning("round %s 跳过: 开盘或收盘15秒内没有有效Chainlink价, 且未取到官方结果", s)
             if outcome:
                 r = r or {}
                 tw_ok = S.tw.t and S.tw.t[-1] >= E - 10
@@ -594,15 +649,17 @@ async def ticker(sess):
             if nxt - now <= LEAD and not S.win[nxt]["pred_done"]:
                 make_pred(nxt)
             ref, rn = get_ref()
-            sg = est_sigma(S.bn, now)
-            if sg:
-                S.sigma = 0.9 * S.sigma + 0.1 * sg
+            if int(now) % 5 == 0:
+                sg = est_sigma_h(ref, now)
+                if sg:
+                    S.sigma = 0.8 * S.sigma + 0.2 * sg
+            shift = nowcast_shift(now) if rn == "chainlink" else 0.0
             v = {"now": now, "s0": s0, "ref": rn, "spot": ref.last(), "bn": S.bn.last(), "okx": S.okx.last(),
                  "sigma": S.sigma, "cur": None}
             cur = S.win[s0]
             if ref.last() is not None:
                 op0 = official_p0(s0)
-                r = fair(now, s0, ref, S.sigma, p0_fix=op0)
+                r = fair(now, s0, ref, S.sigma, p0_fix=op0, shift=shift)
                 if r:
                     r["p_raw"] = r["p"]
                     r["p"] = calibrate(r["p"], now - s0)
@@ -623,13 +680,28 @@ async def ticker(sess):
                             "twap": S.tw.last(), "p0": round(r["p0"], 2), "p0_src": r["p0_src"],
                             "c_est": round(r["c"], 2), "p_up": round(r["p"], 4), "p_raw": round(r["p_raw"], 4),
                             "sd": round(r["sd"], 2), "up_bid": ub, "up_ask": ua, "dn_bid": db, "dn_ask": da,
-                            "flow": ft["flow"], "obi": ft["obi"], "r1": ft["r1"], "bn_cl_bps": ft["bn_cl_bps"]})
+                            "flow": ft["flow"], "obi": ft["obi"], "r1": ft["r1"], "bn_cl_bps": ft["bn_cl_bps"],
+                            "shift": round(shift, 2), "sigma": round(S.sigma, 3)})
             nw = S.win[nxt]
             v["nxt"] = {"start": nxt, "pred": nw.get("pred"), "p": nw.get("p_pred"), "conf": nw.get("conf")}
             S.view = v
         except Exception:
             log.exception("ticker")
         await asyncio.sleep(max(0.05, 1 - (time.time() % 1)))
+
+
+async def cl_watchdog():
+    """订阅成功但价格流静默(只回一包快照后不再推送)时, 切换订阅方式并强制重连"""
+    while True:
+        await asyncio.sleep(5)
+        try:
+            if cl_stalled():
+                S.cl_nofilter = not S.cl_nofilter
+                log.warning("Chainlink价格流超过20秒无新数据, 强制重连并切换订阅方式(不带过滤=%s)", S.cl_nofilter)
+                S.conn_t = time.time()
+                await S.pm_ws.close()
+        except Exception:
+            log.exception("watchdog")
 
 
 async def status():
@@ -670,22 +742,32 @@ async def index(req):
     return web.Response(text=HTML, content_type="text/html")
 
 
-HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BTC5m</title><style>
-body{background:#0e1116;color:#d6dbe3;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:12px}
-h3{margin:16px 0 6px;color:#8aa}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BTC 5分钟涨跌盘 监控</title><style>
+body{background:#0e1116;color:#d6dbe3;font:13px/1.6 -apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",ui-monospace,Menlo,Consolas,monospace;margin:12px}
+h2{margin:0 0 8px;font-size:16px;color:#e6edf3}h3{margin:16px 0 6px;color:#8aa;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
 .card{background:#161b22;border:1px solid #232a34;border-radius:6px;padding:8px}.k{color:#7d8590;font-size:11px}.v{font-size:17px}
-.up{color:#3fb950}.dn{color:#f85149}.warn{color:#d29922}table{border-collapse:collapse;width:100%}
-td,th{padding:3px 6px;border-bottom:1px solid #232a34;text-align:right}th{color:#7d8590}
-canvas{width:100%;height:230px;background:#161b22;border:1px solid #232a34;border-radius:6px}</style></head><body>
-<div id="feeds"></div><h3>当前场次</h3><div id="top" class="grid"></div>
-<h3>价格 (近7分钟; 竖线=场次边界, 虚线=本场P0)</h3><canvas id="c1"></canvas>
-<h3>本场: 公允P(Up) vs Polymarket Up买/卖 (横轴=开盘后秒数, 240处=最后一分钟开始)</h3><canvas id="c2"></canvas>
-<h3>下一场预判</h3><div id="nxt"></div><h3>历史场次</h3><div id="stats"></div><div id="tbl"></div>
+.up{color:#3fb950}.dn{color:#f85149}.warn{color:#d29922}.mut{color:#7d8590}
+table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1px solid #232a34;text-align:right;white-space:nowrap}th{color:#7d8590}
+.wrap{overflow-x:auto}canvas{width:100%;height:230px;background:#161b22;border:1px solid #232a34;border-radius:6px}
+.tip{color:#7d8590;font-size:12px;margin:2px 0 6px}</style></head><body>
+<h2>BTC 5分钟涨跌盘 · 实时监控</h2>
+<div id="feeds"></div>
+<h3>当前场次</h3><div id="top" class="grid"></div>
+<h3>价格走势（近7分钟）</h3><div class="tip">竖线 = 场次边界；绿色虚线 = 本场开盘基准价（收盘均价高于它则“涨”）</div><canvas id="c1"></canvas>
+<h3>本场：模型上涨概率 与 盘口“涨”的买卖价</h3><div class="tip">横轴 = 开盘后秒数，240秒处为最后一分钟开始。绿线高于红线（涨卖一）越多，模型认为“涨”越被低估</div><canvas id="c2"></canvas>
+<h3>下一场预判</h3><div id="nxt"></div>
+<h3>历史场次</h3><div id="stats"></div><div class="wrap" id="tbl"></div>
 <script>
 const Q=location.search,$=id=>document.getElementById(id),f=(x,d=2)=>x==null?'-':Number(x).toFixed(d);
-const card=(k,v,c='')=>`<div class="card"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
-const hm=s=>new Date(s*1000).toISOString().slice(11,16)+'Z';
+const ud=x=>({Up:'涨',Down:'跌'}[x]||x||'-');
+const REF={'chainlink':'Chainlink','binance*':'币安(代理，未连上Chainlink)'};
+const LAB={'calc':'自算','polymarket':'官方'};
+const AUTH=a=>a=='ok'?'已认证':a=='no-creds'?'未配置凭据':a=='deriving'?'正在生成凭据':a=='derive-failed'?'凭据生成失败':a=='authenticating'?'认证中':(a||'').startsWith('FAILED')?'认证失败':a;
+const card=(k,v,c='',tip='')=>`<div class="card" title="${tip}"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
+const hm=s=>new Date(s*1000).toISOString().slice(11,16)+' UTC';
+const age=a=>a==null?'<span class=dn>无数据</span>':(a<5?`<span class=up>${a.toFixed(1)}秒</span>`:`<span class=warn>${a.toFixed(0)}秒</span>`);
 function plot(cv,lines,o={}){const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;
 const g=cv.getContext('2d');g.scale(dpr,dpr);let xs=[],ys=[];lines.forEach(l=>l.d.forEach(p=>{if(p[1]!=null){xs.push(p[0]);ys.push(p[1])}}));
 (o.h||[]).forEach(h=>ys.push(h.y));if(!xs.length)return;
@@ -695,28 +777,32 @@ g.font='10px monospace';g.lineWidth=1;for(let i=0;i<=4;i++){const y=y0+(y1-y0)*i
 (o.v||[]).forEach(v=>{if(v<x0||v>x1)return;g.strokeStyle='#555';g.beginPath();g.moveTo(X(v),10);g.lineTo(X(v),H-16);g.stroke()});
 (o.h||[]).forEach(h=>{g.strokeStyle=h.c;g.setLineDash([4,3]);g.beginPath();g.moveTo(44,Y(h.y));g.lineTo(W-8,Y(h.y));g.stroke();g.setLineDash([])});
 lines.forEach(l=>{g.strokeStyle=l.c;g.lineWidth=1.5;g.beginPath();let on=false;l.d.forEach(p=>{if(p[1]==null){on=false;return}const x=X(p[0]),y=Y(p[1]);if(on)g.lineTo(x,y);else{g.moveTo(x,y);on=true}});g.stroke()});
-let lx=48;lines.forEach(l=>{g.fillStyle=l.c;g.fillText(l.n,lx,9);lx+=l.n.length*7+14})}
-const age=a=>a==null?'<span class=dn>无数据</span>':(a<5?`<span class=up>${a.toFixed(1)}s</span>`:`<span class=warn>${a.toFixed(0)}s</span>`);
+let lx=48;lines.forEach(l=>{g.fillStyle=l.c;g.font='11px sans-serif';g.fillText(l.n,lx,9);lx+=l.n.length*12+16})}
 function draw(d){const c=d.cur,F=d.feeds||{};
-$('feeds').innerHTML=`数据延迟: 币安 ${age(F.bn)} | 欧易 ${age(F.okx)} | Chainlink现货 ${age(F.cl)} | Chainlink TWAP ${age(F.tw)} | Polymarket盘口 ${age(F.pm)} | PolyBolt认证: <b>${d.auth}</b> | 参考价: <b>${d.ref}</b>`;
-let h=card('参考价',f(d.spot))+card('Binance / OKX',f(d.bn,1)+' / '+f(d.okx,1))+card('σ ($/√s)',f(d.sigma,2));
-if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+'s')+card('开盘TWAP (P0)',f(c.p0))
-+card('预计收盘TWAP',f(c.c)+` (${c.mu>=0?'+':''}${f(c.mu,1)})`,c.mu>=0?'up':'dn')+card('收盘不确定度 sd','$'+f(c.sd,1))
-+card('公允 P(Up)',f(c.p,3),c.p>=.5?'up':'dn')+card('Up 买/卖',f(c.up_bid,2)+' / '+f(c.up_ask,2))
-+card('Down 买/卖',f(c.dn_bid,2)+' / '+f(c.dn_ask,2))
-+card('Edge Up / Down',f(c.edge_up,3)+' / '+f(c.edge_dn,3),(c.edge_up>.05||c.edge_dn>.05)?'warn':'')
-+card('本场预判',c.pred?`${c.pred} (${f(c.p_pred,3)})`:'无')}
+$('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
+let h=card('参考价',f(d.spot),'','用于结算判断的价格（Chainlink，未连上时用币安代理）')
++card('币安 / 欧易',f(d.bn,1)+' / '+f(d.okx,1),'','两家交易所的最新成交价')
++card('波动率 σ',f(d.sigma,2)+' 美元/√秒','','30秒尺度的价格波动，用于计算不确定度');
+if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+' 秒')
++card('开盘基准价',f(c.p0),'','开盘前60秒的Chainlink均价，开盘后固定不变。收盘均价≥它则判“涨”')
++card('预计收盘均价',f(c.c)+` (${c.mu>=0?'+':''}${f(c.mu,1)})`,c.mu>=0?'up':'dn','最后60秒的预计均价；括号内为与开盘基准价的差（美元）')
++card('收盘不确定度','± $'+f(c.sd,1),'','预计收盘均价的标准差，越接近收盘越小')
++card('模型：涨的概率',f(c.p,3),c.p>=.5?'up':'dn','模型估计的“涨”概率')
++card('“涨” 买一 / 卖一',f(c.up_bid,2)+' / '+f(c.up_ask,2),'','Polymarket上“涨”份额的最高买价 / 最低卖价')
++card('“跌” 买一 / 卖一',f(c.dn_bid,2)+' / '+f(c.dn_ask,2),'','Polymarket上“跌”份额的最高买价 / 最低卖价')
++card('模型优势：涨 / 跌',f(c.edge_up,3)+' / '+f(c.edge_dn,3),(c.edge_up>.05||c.edge_dn>.05)?'warn':'','模型概率 减 盘口卖价。为正说明该方向按模型被低估；超过0.05会高亮（未扣手续费）')
++card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无','','开盘前20秒做出的预判')}
 $('top').innerHTML=h;
-const s0=d.s0,bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
+const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
 const L=(i,n,col)=>({n,c:col,d:d.chart.map(r=>[r[0],r[i]])});
-plot($('c1'),[L(1,'参考价','#e6edf3'),L(2,'Binance','#58a6ff'),L(3,'OKX','#a371f7'),L(4,'CL-TWAP60','#f0883e')],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
-const T=d.ticks||[];plot($('c2'),[{n:'公允P(Up)',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'Up卖一',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'Up买一',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
-const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}: `+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${n.pred}</b> p=${f(n.p,3)} ${n.conf?'(有信心)':'(弱信号)'}`:`开盘前${20}s给出预判 (还有 ${Math.max(0,n.start-d.now).toFixed(0)}s)`):'';
-const st=d.stats;$('stats').innerHTML=`共 ${st.n} 场, 命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} | 有信心 ${st.cn} 场, 命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}`;
-let t='<table><tr><th>场次</th><th>预判</th><th>p</th><th>结果</th><th>命中</th><th>结果来源</th><th>P0(算)</th><th>C(算)</th><th>P0(官方)</th><th>C(官方)</th><th>Up卖/Down卖@预判</th></tr>';
-d.rounds.slice().reverse().forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${r.pred}</td><td>${f(r.p_pred,3)}</td><td>${r.outcome}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔':'✘'}</td><td>${r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td><td>${f(r.up_ask0,2)}/${f(r.dn_ask0,2)}</td></tr>`});
+plot($('c1'),[L(1,'参考价','#e6edf3'),L(2,'币安','#58a6ff'),L(3,'欧易','#a371f7'),L(4,'官方60秒均价','#f0883e')],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
+const T=d.ticks||[];plot($('c2'),[{n:'模型：涨的概率',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},{n:'“涨”卖一',c:'#f85149',d:T.map(r=>[r[0],r[3]])},{n:'“涨”买一',c:'#d29922',d:T.map(r=>[r[0],r[2]])}],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
+const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'';
+const st=d.stats;$('stats').innerHTML=`共 ${st.n} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>`;
+let t='<table><tr><th>场次(UTC)</th><th>预判</th><th>预判概率</th><th>结果</th><th>命中</th><th>结果来源</th><th>开盘基准(自算)</th><th>收盘均价(自算)</th><th>开盘基准(官方)</th><th>收盘均价(官方)</th><th>预判时卖价 涨/跌</th></tr>';
+d.rounds.slice().reverse().forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${ud(r.pred)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔ 中':'✘ 错'}</td><td>${LAB[r.label]||r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td><td>${f(r.up_ask0,2)} / ${f(r.dn_ask0,2)}</td></tr>`});
 $('tbl').innerHTML=t+'</table>'}
-async function tick(){try{const r=await fetch('/api/state'+Q);if(!r.ok){$('feeds').textContent='HTTP '+r.status;return}draw(await r.json())}catch(e){}}
+async function tick(){try{const r=await fetch('/api/state'+Q);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
 tick();setInterval(tick,1000);
 </script></body></html>'''
 
@@ -731,7 +817,7 @@ async def main(host, port):
         await web.TCPSite(runner, host, port).start()
         log.info("看板: http://%s:%s/%s", host, port, f"?token={DASH_TOKEN}" if DASH_TOKEN else "")
         await asyncio.gather(ws_poly(sess), ws_binance(sess), ws_okx(sess),
-                             ticker(sess), pm_fallback(sess), status())
+                             ticker(sess), pm_fallback(sess), cl_watchdog(), status())
 
 
 if __name__ == "__main__":
