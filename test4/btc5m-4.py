@@ -146,10 +146,10 @@ def fair(t, s0, ref, sigma, p0_fix=None, shift=0.0):
             known = sum((ref.at(a + i + 1) or st) for i in range(k)) * ((kb - a) / k)
         return known + st * max(0.0, b - max(a, t))
 
-    p0 = avg_part(s0 - TW, s0) / TW
+    p0_self = avg_part(s0 - TW, s0) / TW
     c = avg_part(e - TW, e) / TW
-    if p0_fix is not None and t >= s0:   # 开盘后P0已固定, 用官方TWAP值
-        p0 = p0_fix
+    # 开盘后模型可用官方 TWAP 作 P0；自算值始终保留，供对照，避免日志里“自算=官方”
+    p0 = p0_fix if (p0_fix is not None and t >= s0) else p0_self
     mu = c - p0
 
     def rng(a, b):
@@ -169,7 +169,7 @@ def fair(t, s0, ref, sigma, p0_fix=None, shift=0.0):
         p = 1.0 if mu >= 0 else 0.0
     else:
         p = 0.5 * (1 + math.erf(mu / (sd * math.sqrt(2))))
-    return {"p": p, "mu": mu, "sd": sd, "p0": p0, "c": c}
+    return {"p": p, "mu": mu, "sd": sd, "p0": p0, "p0_self": p0_self, "c": c}
 
 
 CALIB = []
@@ -586,8 +586,10 @@ async def settle(sess, s):
         if w:
             # 自算结果只用Chainlink价(不退回币安代理); 开盘/收盘15秒内都要有Chainlink价才有效
             cl_ok = cl_near(s) and cl_near(E)
-            r = fair(E + 1, s, S.cl, 1.0, p0_fix=official_p0(s)) if cl_ok and S.cl.last() is not None else None
-            calc = ("Up" if r["c"] >= r["p0"] else "Down") if r else None
+            p0_tw = official_p0(s)
+            r = fair(E + 1, s, S.cl, 1.0, p0_fix=p0_tw) if cl_ok and S.cl.last() is not None else None
+            # 对照用纯自算: 自算开盘均价 vs 自算收盘均价；模型里的 p0 可能已被官方 TWAP 覆盖
+            calc = ("Up" if r["c"] >= r["p0_self"] else "Down") if r else None
             outcome, src = None, "calc"
             for it in range(40):
                 outcome = await gamma_outcome(sess, s)
@@ -604,18 +606,18 @@ async def settle(sess, s):
             if outcome:
                 r = r or {}
                 tw_ok = S.tw.t and S.tw.t[-1] >= E - 10
-                p0_tw = official_p0(s)
                 c_tw = S.tw.at(E) if tw_ok else None
+                p0_calc = r.get("p0_self", r.get("p0", 0))
                 # 每个场次都记录结果(含没做预判的), 供 analyze.py 回测
                 append_csv(f"{DATA}/outcomes.csv", {
                     "start": s, "outcome": outcome, "label": src, "calc_outcome": calc,
-                    "p0_calc": round(r.get("p0", 0), 2), "c_calc": round(r.get("c", 0), 2),
+                    "p0_calc": round(p0_calc, 2), "c_calc": round(r.get("c", 0), 2),
                     "p0_tw": round(p0_tw, 2) if p0_tw else None, "c_tw": round(c_tw, 2) if c_tw else None})
                 if w.get("pred"):
                     row = {"start": s, "time_utc": time.strftime("%m-%d %H:%M", time.gmtime(s)),
                            "pred": w["pred"], "p_pred": round(w["p_pred"], 4), "conf": int(w["conf"]),
                            "outcome": outcome, "label": src, "hit": int(w["pred"] == outcome),
-                           "calc_outcome": calc, "p0_calc": round(r.get("p0", 0), 2),
+                           "calc_outcome": calc, "p0_calc": round(p0_calc, 2),
                            "c_calc": round(r.get("c", 0), 2),
                            "p0_tw": round(p0_tw, 2) if p0_tw else None, "c_tw": round(c_tw, 2) if c_tw else None,
                            "ref": w["ref_name"], "sigma": round(S.sigma, 3), **w["f"],
