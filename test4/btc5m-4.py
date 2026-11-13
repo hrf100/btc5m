@@ -12,7 +12,7 @@ btc5m v2 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概�
     POLY_PRIVATE_KEY  钱包私钥。启动时自动换取 API 凭据，不必手填三项
     POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE  已经有凭据时直接用
     DASH_TOKEN  可选，设置后访问看板需带 ?token=xxx
-服务器一行启动:
+服务器一行安装/更新（长久 systemd 服务；已在跑会先停再启）:
   curl -fsSL https://raw.githubusercontent.com/hrf100/btc5m/main/test4/run.sh | bash
 """
 import asyncio, json, time, math, csv, os, logging, argparse
