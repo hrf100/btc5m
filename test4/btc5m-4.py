@@ -32,6 +32,7 @@ LEAD = 20                 # 开盘前多少秒做预判
 CONF_TH = 0.05            # |p-0.5| 超过此值算"有信心"
 DEFAULT_SIGMA = 6.0       # $/sqrt(s), 启动初期用
 DATA = "data"
+ROUNDS_KEEP = 2000          # 看板内存只保留最近 N 场；命中率统计用全部 CSV
 PAPER_CFG_PATH = f"{DATA}/paper_cfg.json"
 PAPER_CSV = f"{DATA}/paper_trades.csv"
 DASH_TOKEN = os.getenv("DASH_TOKEN", "")
@@ -79,13 +80,15 @@ class St:
         self.cl_src = ""
         self.auth = "no-creds"
         self.pm, self.tokens, self.pm_ws = {}, set(), None
-        self.win, self.rounds = {}, deque(maxlen=300)
+        self.win, self.rounds = {}, deque(maxlen=ROUNDS_KEEP)
         self.view, self.sigma = {}, DEFAULT_SIGMA
         self.conn_t = 0.0          # 最近一次PolyBolt连接时间
         self.cl_nofilter = False   # 看门狗触发后切换: 不带symbol过滤订阅, 本地过滤btcusd
         self.paper_cfg = dict(PAPER_DEFAULT)
         self.paper = deque(maxlen=500)   # 模拟成交记录
         self.started = time.time()       # 本次进程启动时间
+        # 全量历史统计(不受 ROUNDS_KEEP 截断); 命中率以 CSV 全量为准
+        self.round_n = self.round_hits = self.round_cn = self.round_chits = 0
 
 
 S = St()
@@ -339,8 +342,38 @@ def _num(v, cast=float):
         return v
 
 
+def _reset_round_stats():
+    S.round_n = S.round_hits = S.round_cn = S.round_chits = 0
+
+
+def _add_round_stat(row):
+    S.round_n += 1
+    hit = int(row.get("hit") or 0)
+    S.round_hits += hit
+    if int(row.get("conf") or 0):
+        S.round_cn += 1
+        S.round_chits += hit
+
+
+def _adj_round_hit(old_hit, new_hit, conf):
+    """官方结果覆盖时修正命中累计。"""
+    d = int(new_hit) - int(old_hit)
+    if not d:
+        return
+    S.round_hits += d
+    if int(conf or 0):
+        S.round_chits += d
+
+
+def round_stats():
+    n, cn = S.round_n, S.round_cn
+    return {"n": n, "acc": (S.round_hits / n) if n else None,
+            "cn": cn, "cacc": (S.round_chits / cn) if cn else None,
+            "shown": len(S.rounds)}
+
+
 def load_rounds():
-    """重启后从 CSV 恢复历史场次到看板。不覆盖文件，只读。"""
+    """重启后从 CSV 恢复：全量计入命中率，内存只保留最近 ROUNDS_KEEP 场供表格翻页。"""
     path = f"{DATA}/rounds_v2.csv"
     if not os.path.exists(path):
         baks = sorted(f for f in os.listdir(DATA) if f.startswith("rounds_v2.csv.") and f.endswith(".bak")) if os.path.isdir(DATA) else []
@@ -350,7 +383,14 @@ def load_rounds():
     try:
         with open(path, newline="") as fh:
             rows = list(csv.DictReader(fh))
-        for r in rows[-S.rounds.maxlen:]:
+        _reset_round_stats()
+        keep = rows[-ROUNDS_KEEP:]
+        for r in rows:
+            for k in ("hit", "conf", "start"):
+                if k in r:
+                    r[k] = _num(r[k], int)
+            _add_round_stat(r)
+        for r in keep:
             for k in ("p_pred", "p0_calc", "c_calc", "p0_tw", "c_tw",
                       "up_bid0", "up_ask0", "dn_bid0", "dn_ask0", "sigma",
                       "r1", "r3", "r5", "r15", "flow", "obi", "bn_cl_bps", "bn_okx_bps"):
@@ -360,7 +400,7 @@ def load_rounds():
                 if k in r:
                     r[k] = _num(r[k], int)
             S.rounds.append(r)
-        log.info("已加载历史场次 %d 场", len(S.rounds))
+        log.info("已加载历史场次 全量=%d 看板=%d", S.round_n, len(S.rounds))
     except Exception:
         log.exception("加载历史场次失败")
 
@@ -839,13 +879,13 @@ def _record_round(w, s, outcome, src, calc, r, p0_tw, c_tw):
            "up_bid0": w["q0"][0], "up_ask0": w["q0"][1], "dn_bid0": w["q0"][2], "dn_ask0": w["q0"][3]}
     append_csv(f"{DATA}/rounds_v2.csv", row)
     S.rounds.append(row)
+    _add_round_stat(row)
     settle_paper(s, outcome)
-    n = len(S.rounds)
-    acc = sum(x["hit"] for x in S.rounds) / n
-    cf = [x["hit"] for x in S.rounds if x["conf"]]
+    st = round_stats()
     log.info("round %s pred=%s(%.3f) outcome=%s[%s] %s | n=%d acc=%.1f%% | conf n=%d acc=%s",
-             s, w["pred"], w["p_pred"], outcome, src, "HIT" if row["hit"] else "MISS", n,
-             acc * 100, len(cf), f"{sum(cf) / len(cf) * 100:.1f}%" if cf else "-")
+             s, w["pred"], w["p_pred"], outcome, src, "HIT" if row["hit"] else "MISS", st["n"],
+             (st["acc"] or 0) * 100, st["cn"],
+             f"{st['cacc'] * 100:.1f}%" if st["cacc"] is not None else "-")
     return row
 
 
@@ -854,10 +894,12 @@ def _upgrade_round(s, official, calc):
     updates = {"outcome": official, "label": "polymarket", "calc_outcome": calc}
     for row in reversed(S.rounds):
         if row.get("start") == s:
+            old_hit = int(row.get("hit") or 0)
             row["outcome"] = official
             row["label"] = "polymarket"
             row["hit"] = int(row["pred"] == official)
             updates["hit"] = row["hit"]
+            _adj_round_hit(old_hit, row["hit"], row.get("conf"))
             log.info("round %s 官方结果已更新: %s -> %s[%s] %s",
                      s, calc, official, "polymarket", "HIT" if row["hit"] else "MISS")
             break
@@ -1090,13 +1132,9 @@ async def api_state(req):
     chart = [[t, ref.at(t), S.bn.at(t), S.okx.at(t), S.tw.at(t)] for t in range(int(now) - 420, int(now), 2)]
     cur = S.win.get(int(now // WIN) * WIN)
     rounds = list(S.rounds)
-    n = len(rounds)
-    cf = [x for x in rounds if x["conf"]]
-    stats = {"n": n, "acc": sum(x["hit"] for x in rounds) / n if n else None,
-             "cn": len(cf), "cacc": sum(x["hit"] for x in cf) / len(cf) if cf else None}
     feeds = {k: (now - v if v else None) for k, v in S.last_msg.items()}
     return web.json_response({**S.view, "chart": chart, "ticks": cur["ticks"] if cur else [],
-                              "rounds": rounds, "stats": stats, "feeds": feeds,
+                              "rounds": rounds, "stats": round_stats(), "feeds": feeds,
                               "auth": S.auth, "cl_src": S.cl_src, "host": host_stats(),
                               "paper_cfg": S.paper_cfg, "paper_trades": list(S.paper),
                               "paper_stats": paper_stats()})
@@ -1106,8 +1144,9 @@ async def api_clear_rounds(req):
     """清空看板历史场次；CSV 先归档为 .cleared.*.bak，不直接砸掉。"""
     if not _auth(req):
         return web.Response(status=401, text="bad token")
-    n = len(S.rounds)
+    n = S.round_n
     S.rounds.clear()
+    _reset_round_stats()
     path = f"{DATA}/rounds_v2.csv"
     archived = None
     if os.path.exists(path):
@@ -1315,7 +1354,8 @@ const T=d.ticks||[];plot($('c2'),[
 {n:'跌买',v:c?f(c.dn_bid,2):'-',c:'#39c5cf',d:T.map(r=>[r[0],r[4]])}
 ],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
 const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'';
-const st=d.stats;$('stats').innerHTML=`共 ${st.n} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>`;
+const st=d.stats||{};const shownTip=(st.shown!=null&&st.n>st.shown)?`　<span class=mut>（表内最近 ${st.shown} 场）</span>`:'';
+$('stats').innerHTML=`共 ${st.n||0} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn||0} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>${shownTip}`;
 roundsCache=(d.rounds||[]).slice().reverse();
 renderRounds();
 renderPaper(d)}
