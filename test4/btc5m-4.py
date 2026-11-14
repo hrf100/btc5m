@@ -1011,14 +1011,30 @@ async def status():
 
 # ------------------------------------------------------------------ Web 看板
 _cpu_sample = None
+_net_sample = None  # (ts, rx_bytes, tx_bytes)
+
+
+def _net_bytes():
+    """整机网卡累计收/发字节(排除 lo)。"""
+    rx = tx = 0
+    with open("/proc/net/dev") as fh:
+        for line in fh:
+            if ":" not in line or line.lstrip().startswith("lo:"):
+                continue
+            parts = line.split(":")[1].split()
+            if len(parts) >= 9:
+                rx += int(parts[0])
+                tx += int(parts[8])
+    return rx, tx
 
 
 def host_stats():
-    """读本机 CPU / 内存 (Linux /proc)。不额外装依赖。"""
-    global _cpu_sample
+    """读本机 CPU / 内存 / 网卡流量 (Linux /proc)。不额外装依赖。"""
+    global _cpu_sample, _net_sample
     up = max(0, int(time.time() - S.started))
     out = {"cpu": None, "mem_used_mb": None, "mem_total_mb": None, "proc_mb": None,
-           "uptime_sec": up, "started": round(S.started, 1)}
+           "uptime_sec": up, "started": round(S.started, 1),
+           "net_rx": None, "net_tx": None, "net_rx_bps": None, "net_tx_bps": None}
     try:
         with open("/proc/stat") as fh:
             parts = fh.readline().split()
@@ -1045,6 +1061,18 @@ def host_stats():
                 if line.startswith("VmRSS:"):
                     out["proc_mb"] = round(int(line.split()[1]) / 1024, 1)
                     break
+    except Exception:
+        pass
+    try:
+        t = time.time()
+        rx, tx = _net_bytes()
+        out["net_rx"], out["net_tx"] = rx, tx
+        if _net_sample and t > _net_sample[0]:
+            dt = t - _net_sample[0]
+            if dt > 0:
+                out["net_rx_bps"] = max(0, (rx - _net_sample[1]) / dt)
+                out["net_tx_bps"] = max(0, (tx - _net_sample[2]) / dt)
+        _net_sample = (t, rx, tx)
     except Exception:
         pass
     return out
@@ -1170,8 +1198,10 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 .meter .lab{font-size:10px;color:#7d8590;line-height:1.15}
 .meter .val{font-size:12px;color:#d6dbe3;font-variant-numeric:tabular-nums;line-height:1.2}
 .meter .sub{font-size:10px;color:#7d8590;line-height:1.15}
-#feeds{margin-bottom:2px}</style></head><body>
+#feeds{margin-bottom:2px}
+#netline{color:#7d8590;font-size:12px;margin:0 0 6px;font-variant-numeric:tabular-nums}</style></head><body>
 <div class="topline"><h2>BTC 5分钟涨跌盘 · 实时监控</h2><div id="host" class="host-meters"></div></div>
+<div id="netline"></div>
 <div id="feeds"></div>
 <h3>当前场次</h3><div id="top" class="grid"></div>
 <h3>价格走势（近7分钟）</h3><div class="tip">竖线 = 场次边界；绿色虚线 = 本场开盘基准价（收盘均价高于它则“涨”）</div><canvas id="c1"></canvas>
@@ -1244,6 +1274,10 @@ function fmtUp(sec){sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floo
 if(d>0)return `${d}天 ${h}时${String(m).padStart(2,'0')}分`;
 if(h>0)return `${h}时${String(m).padStart(2,'0')}分${String(s).padStart(2,'0')}秒`;
 return `${m}分${String(s).padStart(2,'0')}秒`}
+function fmtBytes(n){n=Number(n);if(!isFinite(n)||n<0)return'-';
+const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}
+return(i===0?Math.round(n):n.toFixed(n>=100?0:n>=10?1:2))+u[i]}
+function fmtRate(bps){return bps==null?'-':fmtBytes(bps)+'/s'}
 function drawHost(H){H=H||{};
 const cpu=H.cpu, memPct=(H.mem_used_mb!=null&&H.mem_total_mb)?(100*H.mem_used_mb/H.mem_total_mb):null;
 const procPct=(H.proc_mb!=null&&H.mem_total_mb)?(100*H.proc_mb/H.mem_total_mb):null;
@@ -1252,7 +1286,9 @@ const memVal=(H.mem_used_mb!=null&&H.mem_total_mb!=null)?`${H.mem_used_mb} / ${H
 const procVal=H.proc_mb==null?'-':`${H.proc_mb} MB`;
 const up=H.uptime_sec, upRing=up==null?0:Math.min(100,(up%(24*3600))/(24*3600)*100);
 const upSub=H.started?('启动 '+new Date(H.started*1000).toISOString().slice(5,16).replace('T',' ')+' UTC'):'本次进程';
-$('host').innerHTML=meter('已运行',upRing,up==null?'-':fmtUp(up),upSub)+meter('CPU',cpu,cpuVal,'整机占用')+meter('内存',memPct,memVal,'已用 / 总量')+meter('本进程',procPct,procVal,'RSS');}
+$('host').innerHTML=meter('已运行',upRing,up==null?'-':fmtUp(up),upSub)+meter('CPU',cpu,cpuVal,'整机占用')+meter('内存',memPct,memVal,'已用 / 总量')+meter('本进程',procPct,procVal,'RSS');
+const hasNet=H.net_rx!=null||H.net_tx!=null;
+$('netline').innerHTML=hasNet?`流量 ↓${fmtRate(H.net_rx_bps)} ↑${fmtRate(H.net_tx_bps)}　累计 ↓${fmtBytes(H.net_rx)} ↑${fmtBytes(H.net_tx)}`:'';}
 function draw(d){const c=d.cur,F=d.feeds||{};
 drawHost(d.host);
 $('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
