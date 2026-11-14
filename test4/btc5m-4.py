@@ -85,6 +85,7 @@ class St:
         self.cl_nofilter = False   # 看门狗触发后切换: 不带symbol过滤订阅, 本地过滤btcusd
         self.paper_cfg = dict(PAPER_DEFAULT)
         self.paper = deque(maxlen=500)   # 模拟成交记录
+        self.started = time.time()       # 本次进程启动时间
 
 
 S = St()
@@ -1015,7 +1016,9 @@ _cpu_sample = None
 def host_stats():
     """读本机 CPU / 内存 (Linux /proc)。不额外装依赖。"""
     global _cpu_sample
-    out = {"cpu": None, "mem_used_mb": None, "mem_total_mb": None, "proc_mb": None}
+    up = max(0, int(time.time() - S.started))
+    out = {"cpu": None, "mem_used_mb": None, "mem_total_mb": None, "proc_mb": None,
+           "uptime_sec": up, "started": round(S.started, 1)}
     try:
         with open("/proc/stat") as fh:
             parts = fh.readline().split()
@@ -1237,13 +1240,19 @@ tick();
 const meterColor=p=>p==null?'#58a6ff':(p<55?'#3fb950':(p<80?'#d29922':'#f85149'));
 const meter=(lab,pct,val,sub='')=>{const p=pct==null?0:Math.max(0,Math.min(100,pct));const shown=pct==null?'--':Math.round(p);
 return `<div class="meter" title="${lab}"><div class="ring" style="--p:${p};--c:${meterColor(pct)}"><span>${shown}</span></div><div><div class="lab">${lab}</div><div class="val">${val}</div>${sub?`<div class="sub">${sub}</div>`:''}</div></div>`};
+function fmtUp(sec){sec=Math.max(0,Math.floor(Number(sec)||0));const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60),s=sec%60;
+if(d>0)return `${d}天 ${h}时${String(m).padStart(2,'0')}分`;
+if(h>0)return `${h}时${String(m).padStart(2,'0')}分${String(s).padStart(2,'0')}秒`;
+return `${m}分${String(s).padStart(2,'0')}秒`}
 function drawHost(H){H=H||{};
 const cpu=H.cpu, memPct=(H.mem_used_mb!=null&&H.mem_total_mb)?(100*H.mem_used_mb/H.mem_total_mb):null;
 const procPct=(H.proc_mb!=null&&H.mem_total_mb)?(100*H.proc_mb/H.mem_total_mb):null;
 const cpuVal=cpu==null?'采样中…':`${Number(cpu).toFixed(1)}%`;
 const memVal=(H.mem_used_mb!=null&&H.mem_total_mb!=null)?`${H.mem_used_mb} / ${H.mem_total_mb} MB`:'-';
 const procVal=H.proc_mb==null?'-':`${H.proc_mb} MB`;
-$('host').innerHTML=meter('CPU',cpu,cpuVal,'整机占用')+meter('内存',memPct,memVal,'已用 / 总量')+meter('本进程',procPct,procVal,'RSS');}
+const up=H.uptime_sec, upRing=up==null?0:Math.min(100,(up%(24*3600))/(24*3600)*100);
+const upSub=H.started?('启动 '+new Date(H.started*1000).toISOString().slice(5,16).replace('T',' ')+' UTC'):'本次进程';
+$('host').innerHTML=meter('已运行',upRing,up==null?'-':fmtUp(up),upSub)+meter('CPU',cpu,cpuVal,'整机占用')+meter('内存',memPct,memVal,'已用 / 总量')+meter('本进程',procPct,procVal,'RSS');}
 function draw(d){const c=d.cur,F=d.feeds||{};
 drawHost(d.host);
 $('feeds').innerHTML=`数据延迟：币安 ${age(F.bn)} ｜ 欧易 ${age(F.okx)} ｜ Chainlink现货 ${age(F.cl)} ｜ Chainlink 60秒均价 ${age(F.tw)} ｜ Polymarket盘口 ${age(F.pm)} ｜ 凭据状态：<b>${AUTH(d.auth)}</b> ｜ 参考价来源：<b>${REF[d.ref]||d.ref}</b>`;
